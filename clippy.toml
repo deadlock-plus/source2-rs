@@ -1,0 +1,9 @@
+# Product and format names that `doc_markdown` mistakes for code items.
+doc-valid-idents = [
+    "KeyValues",
+    "ValveResourceFormat",
+    "Source2",
+    "..",
+]
+
+msrv = "1.88"

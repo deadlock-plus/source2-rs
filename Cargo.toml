@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/deadlock-plus/source2-rs"
+authors = ["Deftu"]
+
+[workspace.dependencies]
+source2-kv3 = { version = "0.1.0", path = "crates/source2-kv3", default-features = false }
+source2-resource = { version = "0.1.0", path = "crates/source2-resource" }
+source2-vpk = { version = "0.1.0", path = "crates/source2-vpk" }
+
+# Pure Rust so `forbid(unsafe_code)` holds and no C toolchain is needed to cross-compile.
+# KV3 stores LZ4 blocks, not frames, so `frame` is dropped along with its transitive
+# `twox-hash`. `safe-decode` and `checked-decode` keep it free of `unsafe`.
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode", "checked-decode", "std"] }
+ruzstd = { version = "0.9", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_panics_doc = "warn"
+doc_markdown = "warn"
+needless_pass_by_value = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+items_after_statements = "warn"
+redundant_closure_for_method_calls = "warn"
