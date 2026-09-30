@@ -161,7 +161,11 @@ impl VpkWriter {
                 inline.extend_from_slice(rest);
                 (ARCHIVE_INLINE, offset)
             } else if rest.is_empty() {
-                (ARCHIVE_INLINE, 0)
+                // Valve's tools give wholly empty files this offset.
+                (
+                    ARCHIVE_INLINE,
+                    if preload.is_empty() { u32::MAX } else { 0 },
+                )
             } else {
                 let start_new = archives
                     .last()

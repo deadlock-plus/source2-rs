@@ -156,6 +156,11 @@ fn round_trips_through_the_reader_in_both_versions() {
         assert_eq!(vpk.read_path("toplevel.txt").unwrap(), b"root file");
         assert_eq!(vpk.read_path("LICENSE").unwrap(), b"no extension");
         assert_eq!(vpk.read_path("scripts/empty.txt").unwrap(), b"");
+        let empty = vpk.find("scripts/empty.txt").unwrap();
+        assert_eq!(
+            (empty.archive, empty.offset, empty.length),
+            (None, u32::MAX, 0)
+        );
     }
 }
 
