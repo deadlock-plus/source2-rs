@@ -1,0 +1,15 @@
+[package]
+name = "source2-vpk"
+description = "Reader for Valve Pak (VPK) archives"
+keywords = ["source2", "vpk", "valve", "archive"]
+categories = ["game-development", "parser-implementations"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[lints]
+workspace = true
