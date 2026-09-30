@@ -54,7 +54,7 @@ use crate::error::{Error, Result};
 /// Real documents nest a handful deep. This exists so a malformed or hostile file cannot
 /// drive the recursive reader into a stack overflow, which is not something a `Result`
 /// could report.
-const MAX_DEPTH: u32 = 128;
+pub(crate) const MAX_DEPTH: u32 = 128;
 
 /// The depth limit has to stay inside a thread stack to be worth anything.
 ///
@@ -221,7 +221,9 @@ impl Object {
         self.entries.is_empty()
     }
 
-    fn insert(&mut self, key: String, value: Value) {
+    /// Append a member. A repeated key is kept, as the format allows it; lookups find
+    /// the first.
+    pub fn insert(&mut self, key: String, value: Value) {
         self.index.entry(key.clone()).or_insert(self.entries.len());
         self.entries.push((key, value));
     }

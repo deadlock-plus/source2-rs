@@ -54,6 +54,8 @@ use crate::error::{Error, Result};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_tests;
 
 /// `KV3\x05` — the revision Deadlock ships.
 pub const MAGIC_V5: u32 = 0x4B56_3305;
@@ -64,6 +66,9 @@ pub const MAGIC_V3: u32 = 0x4B56_3303;
 
 pub mod value;
 pub use value::{Document, Object, Value, parse};
+
+pub mod writer;
+pub use writer::{Version, WriteOptions, write};
 
 /// First four bytes of a zstd frame.
 #[cfg(feature = "zstd")]
