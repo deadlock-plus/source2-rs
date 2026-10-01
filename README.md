@@ -1,23 +1,29 @@
 # source2-rs
 
-Rust readers for Valve's Source 2 file formats.
+Rust libraries for reading and writing Valve's Source 2 file formats.
 
-Read-only for now: the crates parse existing files and do not write them.
+Each crate covers one format end to end, the way a ZIP or RAR crate covers an archive:
+parse a file, change it, write it back, and nothing the format stores is lost.
 
 ## Crates
 
-| Crate | Purpose |
+| Crate | Format |
 | --- | --- |
-| `source2-vpk` | Reader for Valve Pak (VPK) archives |
-| `source2-resource` | Reader for Source 2 compiled-resource containers |
-| `source2-kv3` | Reader for Valve's binary KeyValues 3 (KV3) |
+| `source2-vpk` | Valve Pak (VPK) archives |
+| `source2-resource` | Compiled-resource containers (`*_c`) |
+| `source2-kv1` | KeyValues 1, text and binary |
+| `source2-kv2` | KeyValues 2 / DMX, text and binary |
+| `source2-kv3` | KeyValues 3, text and binary |
+
+The crates are independent of each other. Each crate's README lists the versions it supports and
+what has and has not been checked against real files.
 
 `source2-kv3` has two features, both on by default:
 
-- `lz4`: LZ4 block decompression
-- `zstd`: Zstandard decompression
+- `lz4`: LZ4 compression
+- `zstd`: Zstandard compression
 
-Both are pure Rust. The workspace forbids `unsafe` code.
+All crates are pure Rust. The workspace forbids `unsafe` code.
 
 ## Build and test
 
