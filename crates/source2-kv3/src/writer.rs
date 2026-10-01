@@ -72,8 +72,8 @@ const HEADER_LEN_V4: usize = 72;
 ///
 /// # Errors
 ///
-/// If the tree holds a [`Value::Blob`], which the reader cannot decode and whose layout
-/// is unverified; a string containing NUL, which the string pool cannot represent;
+/// If the tree holds a [`Value::Blob`] and the version is v4, which has no blob area; a
+/// string containing NUL, which the string pool cannot represent;
 /// nesting deeper than the reader allows; or more data than the header's 32-bit sizes
 /// can describe. Also if the compression method is unknown, or its feature is not
 /// enabled.
@@ -145,6 +145,8 @@ mod field {
     pub const VALUE_COUNT: usize = 104;
     pub const B2_ARRAYS: usize = 112;
     pub const B2_ARRAY_ELEMENTS: usize = 116;
+    pub const BLOB_COUNT: usize = 56;
+    pub const BLOB_TOTAL_SIZE: usize = 60;
 }
 
 fn put_u32(header: &mut [u8], at: usize, v: u32) {
@@ -180,6 +182,8 @@ struct Encoder {
     objects: usize,
     arrays: usize,
     array_elements: usize,
+    /// v5 only: stored after the two buffers rather than in a pool.
+    blobs: Vec<Vec<u8>>,
 }
 
 impl Encoder {
@@ -196,6 +200,7 @@ impl Encoder {
             objects: 0,
             arrays: 0,
             array_elements: 0,
+            blobs: Vec::new(),
         }
     }
 
@@ -257,12 +262,14 @@ impl Encoder {
             Value::String(_) => node::STRING,
             Value::Array(_) => node::ARRAY,
             Value::Object(_) => node::OBJECT,
-            Value::Blob(_) => {
-                return Err(Error::Malformed(
-                    "KV3 blob values cannot be written: the reader does not decode them and \
-                     their layout is unverified"
-                        .into(),
-                ));
+            Value::Blob(bytes) => {
+                if self.version == Version::V4 {
+                    return Err(Error::Malformed(
+                        "KV3 v4 has no blob area, so a blob value needs v5".into(),
+                    ));
+                }
+                self.blobs.push(bytes.clone());
+                node::BINARY_BLOB
             }
         };
         self.types.push(ty);
@@ -346,7 +353,14 @@ impl Encoder {
             buf2.extend_from_slice(&e.to_le_bytes());
         }
         buf2.extend_from_slice(&self.types);
+        for b in &self.blobs {
+            buf2.extend_from_slice(&size(b.len(), "blob")?.to_le_bytes());
+        }
         buf2.extend_from_slice(&TRAILER.to_le_bytes());
+        let (area, chunk_sizes) = blob_area(&self.blobs, compression)?;
+        for c in &chunk_sizes {
+            buf2.extend_from_slice(&c.to_le_bytes());
+        }
 
         put_size(
             header,
@@ -380,10 +394,20 @@ impl Encoder {
             "object count",
         )?;
 
+        let blob_total: usize = self.blobs.iter().map(Vec::len).sum();
+        put_size(header, field::BLOB_COUNT, self.blobs.len(), "blob count")?;
+        put_size(header, field::BLOB_TOTAL_SIZE, blob_total, "blob total")?;
+
         let c1 = compress(&buf1, compression)?;
         let c2 = compress(&buf2, compression)?;
         let uncompressed = size(buf1.len() + buf2.len(), "payload")?;
-        let compressed = size(c1.len() + c2.len(), "compressed payload")?;
+        // Only zstd counts the blob frames here; LZ4 files stop at the buffers.
+        let counted_area = if compression == Compression::Zstd {
+            area.len()
+        } else {
+            0
+        };
+        let compressed = size(c1.len() + c2.len() + counted_area, "compressed payload")?;
         put_u32(header, field::UNCOMPRESSED_SIZE, uncompressed);
         put_u32(header, field::COMPRESSED_SIZE, compressed);
         put_size(header, field::BUFFER1_UNCOMPRESSED, buf1.len(), "buffer 1")?;
@@ -412,6 +436,10 @@ impl Encoder {
 
         let mut payload = c1;
         payload.extend_from_slice(&c2);
+        if !self.blobs.is_empty() {
+            payload.extend_from_slice(&area);
+            payload.extend_from_slice(&TRAILER.to_le_bytes());
+        }
         Ok(payload)
     }
 
@@ -452,6 +480,35 @@ impl Encoder {
         )?;
         Ok(compressed)
     }
+}
+
+/// The compressed blob area, and on LZ4 the compressed length of each chunk.
+///
+/// LZ4 compresses each blob in chunks of the frame size, one block per chunk, which the
+/// reader undoes chunk by chunk. zstd takes the blobs back to back as a single stream.
+fn blob_area(blobs: &[Vec<u8>], compression: Compression) -> Result<(Vec<u8>, Vec<u16>)> {
+    let mut chunk_sizes = Vec::new();
+    if blobs.is_empty() {
+        return Ok((Vec::new(), chunk_sizes));
+    }
+    let area = match compression {
+        Compression::Lz4 => {
+            let mut area = Vec::new();
+            for chunk in blobs
+                .iter()
+                .flat_map(|b| b.chunks(usize::from(LZ4_FRAME_SIZE)))
+            {
+                let block = compress_lz4(chunk)?;
+                chunk_sizes.push(u16::try_from(block.len()).map_err(|_| {
+                    Error::Malformed("KV3 blob chunk does not fit a 16-bit length".into())
+                })?);
+                area.extend_from_slice(&block);
+            }
+            area
+        }
+        other => compress(&blobs.concat(), other)?,
+    };
+    Ok((area, chunk_sizes))
 }
 
 fn compress(raw: &[u8], compression: Compression) -> Result<Vec<u8>> {

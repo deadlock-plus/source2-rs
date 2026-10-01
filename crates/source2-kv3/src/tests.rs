@@ -55,7 +55,7 @@ fn kv3_rejects_a_non_kv3_block() {
 ///
 /// The token's high nibble is the literal count, or 15 with the remainder trailing as
 /// 255-valued continuation bytes. The low nibble is the match length, zero here.
-fn lz4_literal_block(data: &[u8]) -> Vec<u8> {
+pub(crate) fn lz4_literal_block(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let n = data.len();
     if n < 15 {

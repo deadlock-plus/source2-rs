@@ -327,13 +327,48 @@ fn an_unknown_compression_method_is_refused() {
 }
 
 #[test]
-fn a_blob_is_refused_because_the_reader_cannot_decode_one() {
+fn a_v4_blob_is_refused_because_v4_has_no_blob_area() {
     let value = object(vec![("b", Value::Blob(vec![1, 2, 3]))]);
-    for version in [Version::V4, Version::V5] {
-        let err = write(&value, &options(version, Compression::None)).unwrap_err();
-        assert!(matches!(err, Error::Malformed(_)));
-        assert!(format!("{err}").contains("blob"), "{err}");
-    }
+    let err = write(&value, &options(Version::V4, Compression::None)).unwrap_err();
+    assert!(matches!(err, Error::Malformed(_)));
+    assert!(format!("{err}").contains("blob"), "{err}");
+}
+
+fn blobs() -> Value {
+    object(vec![
+        ("a", Value::Blob(vec![1, 2, 3])),
+        ("empty", Value::Blob(Vec::new())),
+        (
+            "nested",
+            Value::Array(vec![Value::Blob((0..=255).cycle().take(40_000).collect())]),
+        ),
+    ])
+}
+
+#[test]
+fn v5_blobs_round_trip_uncompressed() {
+    round_trip(&blobs(), Version::V5, Compression::None);
+}
+
+#[cfg(feature = "lz4")]
+#[test]
+fn v5_blobs_round_trip_through_lz4() {
+    round_trip(&blobs(), Version::V5, Compression::Lz4);
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn v5_blobs_round_trip_through_zstd() {
+    round_trip(&blobs(), Version::V5, Compression::Zstd);
+}
+
+#[cfg(feature = "lz4")]
+#[test]
+fn lz4_blobs_state_their_count_and_total_in_the_header() {
+    let bytes = write(&blobs(), &options(Version::V5, Compression::Lz4)).expect("write");
+    let header = parse(&bytes).expect("parse").header;
+    assert_eq!(header.blob_count, 3);
+    assert_eq!(header.blob_total_size, 40_003);
 }
 
 #[test]

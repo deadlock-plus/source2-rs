@@ -52,8 +52,14 @@ pub mod error;
 
 use crate::error::{Error, Result};
 
+#[cfg(all(test, feature = "lz4", feature = "zstd"))]
+mod blob_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod text_read_tests;
+#[cfg(test)]
+mod text_write_tests;
 #[cfg(test)]
 mod write_tests;
 
@@ -69,6 +75,12 @@ pub use value::{Document, Object, Value, parse};
 
 pub mod writer;
 pub use writer::{Version, WriteOptions, write};
+
+pub mod text_read;
+pub use text_read::parse_text;
+
+pub mod text_write;
+pub use text_write::write_text;
 
 /// First four bytes of a zstd frame.
 #[cfg(feature = "zstd")]
@@ -141,7 +153,13 @@ pub struct Header {
     pub eight_byte_count_buffer2: u32,
     /// Number of objects in buffer 2, and so the length of its object-length table.
     pub object_count_buffer2: u32,
-    /// Compressed length of the whole payload, across every frame.
+    /// Number of binary blobs stored after the two buffers. Zero in every `vdata_c`;
+    /// standalone files such as Steam cloud `cached_hero_builds.kv3` carry them.
+    pub blob_count: u32,
+    /// Total length of the blobs once decompressed.
+    pub blob_total_size: u32,
+    /// Compressed length of the payload. Across both buffers for LZ4; for zstd it also
+    /// covers the blob frames when there are any.
     pub compressed_size: u32,
     /// Length the whole payload decompresses to, across every frame.
     pub uncompressed_size: u32,
@@ -172,6 +190,8 @@ mod field {
     pub const EIGHT_BYTES: usize = 36;
     pub const TYPE_COUNT: usize = 40;
     pub const TWO_BYTES: usize = 64;
+    pub const BLOB_COUNT: usize = 56;
+    pub const BLOB_TOTAL_SIZE: usize = 60;
     /// Totals across every frame. Verified against both files Deadlock ships.
     pub const UNCOMPRESSED_SIZE: usize = 48;
     pub const COMPRESSED_SIZE: usize = 52;
@@ -254,16 +274,24 @@ impl Header {
         format.copy_from_slice(&block[field::FORMAT..field::FORMAT + 16]);
 
         let compressed_size = u32_at(field::COMPRESSED_SIZE);
-        // Derived rather than assumed: see the module docs.
-        let payload_offset = block
-            .len()
-            .checked_sub(compressed_size as usize)
-            .ok_or_else(|| {
-                Error::Malformed(format!(
-                    "KV3 declares {compressed_size} compressed bytes in a {} byte block",
-                    block.len()
-                ))
-            })?;
+        let blob_count = v5_only(field::BLOB_COUNT);
+        // Derived rather than assumed: see the module docs. With blobs the block runs on
+        // past the buffers, and LZ4 files do not count that tail in `compressed_size`
+        // while zstd ones do, so the subtraction means nothing and the payload sits right
+        // after the header.
+        let payload_offset = if blob_count > 0 {
+            header_len
+        } else {
+            block
+                .len()
+                .checked_sub(compressed_size as usize)
+                .ok_or_else(|| {
+                    Error::Malformed(format!(
+                        "KV3 declares {compressed_size} compressed bytes in a {} byte block",
+                        block.len()
+                    ))
+                })?
+        };
         if payload_offset < header_len {
             return Err(Error::Malformed(format!(
                 "KV3 payload would start at {payload_offset}, inside a {header_len}-byte header"
@@ -286,6 +314,8 @@ impl Header {
             integer_count_buffer2: v5_only(field::B2_INTEGERS),
             eight_byte_count_buffer2: v5_only(field::B2_EIGHT_BYTES),
             object_count_buffer2: v5_only(field::B2_OBJECTS),
+            blob_count,
+            blob_total_size: v5_only(field::BLOB_TOTAL_SIZE),
             compressed_size,
             uncompressed_size: u32_at(field::UNCOMPRESSED_SIZE),
             buffer1_uncompressed_size: v5_only(field::BUFFER1_UNCOMPRESSED),
@@ -302,8 +332,10 @@ impl Header {
 pub struct Decoded {
     /// The header this came from.
     pub header: Header,
-    /// The decompressed payload.
+    /// The decompressed payload: buffer 1 followed by buffer 2.
     pub payload: Vec<u8>,
+    /// The decompressed binary blobs, in the order the type stream asks for them.
+    pub blobs: Vec<Vec<u8>>,
 }
 
 /// Read a binary KV3 block and undo its compression.
@@ -315,7 +347,22 @@ pub struct Decoded {
 /// promised.
 pub fn decode(block: &[u8]) -> Result<Decoded> {
     let header = Header::parse(block)?;
-    let payload = &block[header.payload_offset..];
+    let mut payload = &block[header.payload_offset..];
+    let mut blob_area: &[u8] = &[];
+    if header.blob_count > 0 {
+        let main_len = match header.compression {
+            Compression::None => header.uncompressed_size as usize,
+            _ => (header.buffer1_compressed_size as usize)
+                .saturating_add(header.buffer2_compressed_size as usize),
+        };
+        if main_len > payload.len() {
+            return Err(Error::Malformed(format!(
+                "KV3 buffers claim {main_len} bytes, payload has {}",
+                payload.len()
+            )));
+        }
+        (payload, blob_area) = payload.split_at(main_len);
+    }
 
     let out = match header.compression {
         Compression::None => payload.to_vec(),
@@ -338,10 +385,153 @@ pub fn decode(block: &[u8]) -> Result<Decoded> {
         )));
     }
 
+    let blobs = read_blobs(&header, &out, blob_area)?;
     Ok(Decoded {
         header,
         payload: out,
+        blobs,
     })
+}
+
+/// Marks the end of a buffer, and again the end of a file that has blobs.
+const TRAILER: [u8; 4] = 0xFFEE_DD00u32.to_le_bytes();
+
+/// Undo the compression of the blob area that follows the two buffers.
+///
+/// Buffer 2 ends with each blob's decompressed length as a u32, then the trailer, then on
+/// LZ4 files a u16 for each compressed chunk. zstd stores the blobs back to back in one
+/// stream. Both end the file with a second trailer.
+///
+/// LZ4 cuts each blob into chunks of at most `frame_size` bytes, compresses them in turn,
+/// and lets a chunk copy from the ones before it, blobs included. So there can be more
+/// chunks than blobs, and every chunk has to be decoded against the output so far.
+fn read_blobs(header: &Header, payload: &[u8], area: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let n = header.blob_count as usize;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let short = || Error::Malformed("KV3 buffer 2 is too short for its blob tables".into());
+    let total = header.blob_total_size as usize;
+
+    let buffer2 = payload
+        .get(header.buffer1_uncompressed_size as usize..)
+        .ok_or_else(short)?;
+    let chunk_len = if header.frame_size == 0 {
+        usize::from(u16::MAX) + 1
+    } else {
+        usize::from(header.frame_size)
+    };
+
+    // The chunk table's length depends on the sizes before the trailer, and the trailer is
+    // found by counting back over the table, so try each plausible length.
+    let (sizes, trailer_at) = if header.compression == Compression::Lz4 {
+        let most = n.saturating_add(total / chunk_len);
+        (n..=most)
+            .find_map(|k| {
+                let trailer_at = buffer2
+                    .len()
+                    .checked_sub(k.checked_mul(2)?.checked_add(4)?)?;
+                let sizes = blob_sizes(buffer2, trailer_at, n, total)?;
+                let chunks: usize = sizes.iter().map(|s| s.div_ceil(chunk_len)).sum();
+                (chunks == k).then_some((sizes, trailer_at))
+            })
+            .ok_or_else(short)?
+    } else {
+        let trailer_at = buffer2.len().checked_sub(4).ok_or_else(short)?;
+        let sizes = blob_sizes(buffer2, trailer_at, n, total).ok_or_else(short)?;
+        (sizes, trailer_at)
+    };
+
+    let area = area.strip_suffix(&TRAILER).unwrap_or(area);
+    let all = match header.compression {
+        Compression::Lz4 => {
+            let mut stream = Vec::with_capacity(total.min(1 << 24));
+            let mut rest = area;
+            let mut chunk = 0;
+            for &size in &sizes {
+                let mut left = size;
+                while left > 0 {
+                    let at = trailer_at + 4 + chunk * 2;
+                    let clen = usize::from(u16::from_le_bytes([buffer2[at], buffer2[at + 1]]));
+                    let block = take_blob_bytes(&mut rest, clen)?;
+                    let want = chunk_len.min(left);
+                    decompress_lz4_chunk(block, want, &mut stream)?;
+                    left -= want;
+                    chunk += 1;
+                }
+            }
+            stream
+        }
+        Compression::Zstd => decompress_zstd(area, total)?,
+        _ => area.to_vec(),
+    };
+    if all.len() != total {
+        return Err(Error::Malformed(format!(
+            "KV3 blobs decompressed to {} bytes, expected {total}",
+            all.len()
+        )));
+    }
+
+    let mut rest = all.as_slice();
+    let mut blobs = Vec::with_capacity(n.min(4096));
+    for &size in &sizes {
+        blobs.push(take_blob_bytes(&mut rest, size)?.to_vec());
+    }
+    Ok(blobs)
+}
+
+/// The blob lengths that end at `trailer_at`, if the trailer is there and they add up to
+/// `total`.
+fn blob_sizes(buffer2: &[u8], trailer_at: usize, n: usize, total: usize) -> Option<Vec<usize>> {
+    if buffer2.get(trailer_at..trailer_at + 4)? != TRAILER {
+        return None;
+    }
+    let raw = &buffer2[trailer_at.checked_sub(n.checked_mul(4)?)?..trailer_at];
+    let sizes: Vec<usize> = raw
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c) as usize)
+        .collect();
+    (sizes.iter().try_fold(0usize, |a, &s| a.checked_add(s))? == total).then_some(sizes)
+}
+
+fn take_blob_bytes<'a>(rest: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
+    if rest.len() < len {
+        return Err(Error::Malformed(format!(
+            "KV3 blob wants {len} bytes, {} left",
+            rest.len()
+        )));
+    }
+    let (a, b) = rest.split_at(len);
+    *rest = b;
+    Ok(a)
+}
+
+/// How far back an LZ4 match can reach.
+#[cfg(feature = "lz4")]
+const LZ4_WINDOW: usize = 64 * 1024;
+
+#[cfg(feature = "lz4")]
+fn decompress_lz4_chunk(block: &[u8], want: usize, stream: &mut Vec<u8>) -> Result<()> {
+    let window = &stream[stream.len().saturating_sub(LZ4_WINDOW)..];
+    let chunk = lz4_flex::block::decompress_with_dict(block, want, window)
+        .map_err(|e| Error::Malformed(format!("lz4 decode of a blob chunk: {e}")))?;
+    if chunk.len() != want {
+        return Err(Error::Malformed(format!(
+            "KV3 blob chunk decompressed to {} bytes, expected {want}",
+            chunk.len()
+        )));
+    }
+    stream.extend_from_slice(&chunk);
+    Ok(())
+}
+
+#[cfg(not(feature = "lz4"))]
+fn decompress_lz4_chunk(_block: &[u8], _want: usize, _stream: &mut Vec<u8>) -> Result<()> {
+    Err(Error::Malformed(
+        "this build has no LZ4 decoder; enable the `lz4` feature".into(),
+    ))
 }
 
 #[cfg(feature = "zstd")]

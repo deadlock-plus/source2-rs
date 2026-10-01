@@ -250,7 +250,7 @@ pub fn parse(block: &[u8]) -> Result<Document> {
     let header = decoded.header;
     let root = match header.version {
         4 => parse_v4(&decoded.payload, &header)?,
-        5 => parse_v5(&decoded.payload, &header)?,
+        5 => parse_v5(&decoded.payload, &header, &decoded.blobs)?,
         other => {
             return Err(Error::Malformed(format!(
                 "the value model handles KV3 v4 and v5, this is v{other}"
@@ -325,6 +325,8 @@ enum ObjectLengths<'a> {
 /// Everything the recursive reader draws from.
 struct Reader<'a> {
     strings: Vec<&'a str>,
+    blobs: &'a [Vec<u8>],
+    next_blob: usize,
     types: &'a [u8],
     object_lengths: ObjectLengths<'a>,
     /// The pool set type codes read from right now.
@@ -367,7 +369,7 @@ fn take<'a>(rest: &mut &'a [u8], len: usize, what: &str) -> Result<&'a [u8]> {
     Ok(a)
 }
 
-fn parse_v5(payload: &[u8], h: &Header) -> Result<Value> {
+fn parse_v5(payload: &[u8], h: &Header, blobs: &[Vec<u8>]) -> Result<Value> {
     let b1_len = h.buffer1_uncompressed_size as usize;
     if payload.len() < b1_len {
         return Err(Error::Malformed(format!(
@@ -443,10 +445,13 @@ fn parse_v5(payload: &[u8], h: &Header) -> Result<Value> {
         "buffer2 8-byte",
     )?;
     let types = take(&mut rest, h.type_count as usize, "type stream")?;
+    take(&mut rest, blobs.len() * 4, "blob lengths")?;
 
     check_trailer(take(&mut rest, 4, "trailer")?)?;
 
     let mut reader = Reader {
+        blobs,
+        next_blob: 0,
         strings,
         types,
         object_lengths: ObjectLengths::Table(object_lengths),
@@ -521,6 +526,8 @@ fn parse_v4(payload: &[u8], h: &Header) -> Result<Value> {
     check_trailer(&payload[blob_start + blob_len..])?;
 
     let mut reader = Reader {
+        blobs: &[],
+        next_blob: 0,
         strings,
         types,
         object_lengths: ObjectLengths::Pool,
@@ -741,9 +748,13 @@ impl<'a> Reader<'a> {
                 Value::Object(object)
             }
             node::BINARY_BLOB => {
-                return Err(Error::Malformed(
-                    "KV3 binary blobs are not decoded; nothing Deadlock ships uses them".into(),
-                ));
+                let blob = self.blobs.get(self.next_blob).ok_or_else(|| {
+                    Error::Malformed(
+                        "KV3 type stream asks for more blobs than the file holds".into(),
+                    )
+                })?;
+                self.next_blob += 1;
+                Value::Blob(blob.clone())
             }
             other => {
                 return Err(Error::Malformed(format!(
