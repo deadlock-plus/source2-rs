@@ -1,0 +1,15 @@
+[package]
+name = "source2-kv1"
+description = "Reader and writer for Valve's KeyValues 1 (KV1) text and binary formats"
+keywords = ["source2", "kv1", "keyvalues", "vdf", "valve"]
+categories = ["game-development", "parser-implementations", "encoding"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[lints]
+workspace = true

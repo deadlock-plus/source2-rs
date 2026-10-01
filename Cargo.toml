@@ -11,6 +11,7 @@ repository = "https://github.com/deadlock-plus/source2-rs"
 authors = ["Deftu"]
 
 [workspace.dependencies]
+source2-kv1 = { version = "0.1.0", path = "crates/source2-kv1" }
 source2-kv3 = { version = "0.1.0", path = "crates/source2-kv3", default-features = false }
 source2-resource = { version = "0.1.0", path = "crates/source2-resource" }
 source2-vpk = { version = "0.1.0", path = "crates/source2-vpk" }
