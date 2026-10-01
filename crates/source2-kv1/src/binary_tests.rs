@@ -1,10 +1,7 @@
-use crate::{Directive, DirectiveKind, Document, Entry, Error, Options, Value};
+use crate::{Directive, Document, Encoding, Entry, Error, Options, Value};
 
 fn doc(roots: Vec<Entry>) -> Document {
-    Document {
-        directives: vec![],
-        roots,
-    }
+    Document::new(roots)
 }
 
 #[test]
@@ -21,7 +18,7 @@ fn reads_hand_built_bytes() {
         d,
         doc(vec![Entry::section(
             "root",
-            vec![Entry::string("k", "v"), Entry::new("n", Value::Int(42)),]
+            vec![Entry::string("k", "v"), Entry::int("n", 42)]
         )])
     );
 }
@@ -54,6 +51,7 @@ fn every_type_round_trips() {
                 Entry::new("w", Value::WString("wide \u{1f980}".into())),
                 Entry::new("c", Value::Color([1, 2, 3, 255])),
                 Entry::new("u", Value::UInt64(u64::MAX)),
+                Entry::int64("l", i64::MIN),
                 Entry::section(
                     "nested",
                     vec![Entry::string("dup", "1"), Entry::string("dup", "2")],
@@ -78,13 +76,17 @@ fn wstring_is_length_prefixed_utf16() {
 #[test]
 fn eof_without_final_end_marker_is_accepted() {
     let d = Document::from_binary(&[1, b'k', 0, b'v', 0]).unwrap();
-    assert_eq!(d, doc(vec![Entry::string("k", "v")]));
+    assert!(!d.layout.end_marker);
+    assert_eq!(d.roots, vec![Entry::string("k", "v")]);
+    assert_eq!(d.to_binary().unwrap(), [1, b'k', 0, b'v', 0]);
 }
 
 #[test]
 fn empty_input_and_lone_end_marker_are_empty() {
-    assert_eq!(Document::from_binary(&[]).unwrap(), Document::default());
-    assert_eq!(Document::from_binary(&[8]).unwrap(), Document::default());
+    assert!(Document::from_binary(&[]).unwrap().roots.is_empty());
+    let lone = Document::from_binary(&[8]).unwrap();
+    assert!(lone.roots.is_empty() && lone.layout.end_marker);
+    assert_eq!(lone.to_binary().unwrap(), [8]);
 }
 
 fn bad(bytes: &[u8]) -> Error {
@@ -103,8 +105,43 @@ fn truncated_inputs_are_errors() {
 }
 
 #[test]
-fn unknown_type_byte() {
-    assert!(matches!(bad(&[9, b'k', 0]), Error::MalformedBinary(_)));
+fn unsupported_type_bytes() {
+    for ty in [9u8, 11, 12, 255] {
+        assert_eq!(
+            bad(&[1, b'a', 0, b'b', 0, ty, b'k', 0]),
+            Error::UnsupportedType {
+                type_byte: ty,
+                offset: 5
+            }
+        );
+    }
+}
+
+#[test]
+fn int64_is_signed_little_endian() {
+    let bytes = [
+        10, b'k', 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 8,
+    ];
+    let d = Document::from_binary(&bytes).unwrap();
+    assert_eq!(d.roots, vec![Entry::int64("k", -1)]);
+    assert_eq!(d.to_binary().unwrap(), bytes);
+}
+
+#[test]
+fn windows_1252_strings_are_preserved() {
+    let bytes = [1, b'k', 0xe9, 0, b'c', b'a', b'f', 0xe9, 0x80, 0, 8];
+    let d = Document::from_binary(&bytes).unwrap();
+    assert_eq!(d.encoding, Encoding::Windows1252);
+    assert_eq!(d.roots[0].key, "k\u{e9}");
+    assert_eq!(d.to_binary().unwrap(), bytes);
+}
+
+#[test]
+fn utf8_strings_stay_utf8() {
+    let bytes = [1, b'k', 0, b'c', b'a', b'f', 0xc3, 0xa9, 0, 8];
+    let d = Document::from_binary(&bytes).unwrap();
+    assert_eq!(d.encoding, Encoding::Utf8);
+    assert_eq!(d.to_binary().unwrap(), bytes);
 }
 
 #[test]
@@ -118,7 +155,6 @@ fn unterminated_key_and_string() {
 
 #[test]
 fn invalid_utf8_and_utf16() {
-    assert!(matches!(bad(&[1, 0xff, 0, 0]), Error::MalformedBinary(_)));
     assert!(matches!(
         bad(&[5, b'w', 0, 1, 0, 0x00, 0xd8]),
         Error::MalformedBinary(_)
@@ -150,13 +186,7 @@ fn writer_rejects_what_binary_cannot_hold() {
     let cond = doc(vec![Entry::string("k", "v").with_condition("$A")]);
     assert!(matches!(cond.to_binary(), Err(Error::InvalidInput(_))));
 
-    let dir = Document {
-        directives: vec![Directive {
-            kind: DirectiveKind::Base,
-            path: "x".into(),
-        }],
-        roots: vec![],
-    };
+    let dir = Document::default().with_directive(Directive::base("x"));
     assert!(matches!(dir.to_binary(), Err(Error::InvalidInput(_))));
 
     let nul = doc(vec![Entry::string("k", "a\0b")]);

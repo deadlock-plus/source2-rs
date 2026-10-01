@@ -1,287 +1,126 @@
 //! Reader and writer for Valve's KeyValues 1 (KV1), text and binary.
 //!
-//! KV1 is the older Valve key/value format: `gameinfo.gi`, `.vcfg` and `.vdf` files. It is an
-//! ordered tree. Every [`Entry`] has a key and either a string or a nested section, and
+//! KV1 is the older Valve key/value format: `.vdf`, `.acf`, `.vcfg` and similar files. It is
+//! an ordered tree. Every [`Entry`] has a key and either a string or a nested section, and
 //! keys may repeat.
 //!
 //! ```no_run
 //! use source2_kv1::Document;
 //!
-//! let doc = Document::parse(&std::fs::read_to_string("gameinfo.gi")?)?;
-//! let game = doc.get("GameInfo").and_then(|e| e.get_str("game"));
-//! println!("{}", doc.to_text()?);
+//! let doc = Document::parse_bytes(&std::fs::read("settings.vdf")?)?;
+//! let name = doc.get("Settings").and_then(|e| e.get_str("name"));
+//! std::fs::write("copy.vdf", doc.to_text_bytes()?)?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
+//! Building a document by hand needs no layout information:
+//!
+//! ```
+//! use source2_kv1::{Document, Entry};
+//!
+//! let doc = Document::new(vec![
+//!     Entry::section("Settings", vec![Entry::string("name", "demo"), Entry::bool("on", true)])
+//!         .with_comment(" generated"),
+//! ]);
+//! assert_eq!(
+//!     doc.to_text()?,
+//!     "// generated\n\"Settings\"\n{\n\t\"name\"\t\t\"demo\"\n\t\"on\"\t\t\"1\"\n}\n"
+//! );
+//! # Ok::<(), source2_kv1::Error>(())
+//! ```
+//!
+//! # Round trip
+//!
+//! Parsing then writing gives back the same bytes. What the tree does not need for its
+//! meaning is kept in `layout` fields on [`Document`], [`Entry`] and [`Directive`]: `//`
+//! comments, blank lines and spacing, line endings, a byte order mark, whether a token was
+//! quoted or bare, the exact spelling of escapes, directive keyword case, where each
+//! conditional tag sat, and the text encoding. Every one of them is optional. A hand-built
+//! document leaves them at their defaults and is written in Valve's conventional layout.
+//! [`Document::without_layout`] drops them to compare content only.
+//!
 //! # Escape sequences
 //!
-//! Valve's parser only honours escapes when a caller opts in with
-//! `KeyValues::UsesEscapeSequences`, and the engine default is off. Tools and Steam treat
-//! backslashes as escapes, so [`Options::escape_sequences`] defaults to **on**. When on,
-//! `\n`, `\t`, `\\` and `\"` are decoded and any other `\x` is kept verbatim, backslash
-//! included, so Windows paths survive. When off, a backslash is an ordinary character and a
-//! value cannot contain `"`.
+//! Valve's parser only honours escapes when a caller opts in, and the engine default is off.
+//! Tools and Steam treat backslashes as escapes, so [`Options::escape_sequences`] defaults to
+//! **on**. When on, the set `\n \t \v \b \r \f \a \\ \? \' \"` is decoded and any other `\x`
+//! is kept verbatim, backslash included, so Windows paths survive. When off, a backslash is
+//! an ordinary character and a value cannot contain `"`. The choice is stored in
+//! [`Document::escapes`] and the writer follows it, so a file read with escapes off is
+//! written with escapes off. The set is from Valve's string conversion table as remembered;
+//! it is not checked against Valve source or a sample that uses the rarer escapes.
 //!
-//! # Other choices
+//! # Typed values
 //!
+//! Text KV1 has no types: every leaf is a string. The binary form has [`Value::Int`],
+//! [`Value::Float`] and others. Writing them to text would lose the type, so
+//! [`Document::to_text`] returns [`Error::TypedValueInText`] for them. To write them anyway,
+//! convert on purpose with [`Document::stringified`] (`Int(5)` becomes the string `"5"`).
+//!
+//! # Encodings
+//!
+//! Text and binary strings are UTF-8 when they are valid UTF-8 and Windows-1252 otherwise,
+//! recorded in [`Document::encoding`]. Each Windows-1252 byte maps to one character, so
+//! the bytes come back exactly. Use [`Document::parse_bytes`] and
+//! [`Document::to_text_bytes`] for files; [`Document::parse`] takes text you already hold as
+//! UTF-8. UTF-16 text is an error.
+//!
+//! # Binary
+//!
+//! Type bytes: `0` section, `1` string, `2` int, `3` float, `4` ptr, `5` wide string,
+//! `6` color, `7` uint64, `8` end, `10` int64. Anything else is
+//! [`Error::UnsupportedType`]: `9` and `11` (compiled-int and alternate-end bytes seen in
+//! other tools' notes) and the string-table variant of Steam's `appinfo.vdf`, whose key names
+//! are table indices. Whether the closing end marker was present is kept in
+//! [`DocumentLayout::end_marker`], so files that stop without it are rewritten without it.
+//! Nothing here was checked against a real binary KV1 file; the layout is from memory.
+//!
+//! # Includes and conditions
+//!
+//! - `#include` and `#base` are recognised only at the top level of a file and become
+//!   [`Directive`]s, in file order (see [`Directive::before_root`]). Nothing is opened, so
+//!   nested includes are never followed or merged; that is left to the caller.
+//!   Inside a section the same word is an ordinary key and is kept as an entry.
+//! - A conditional tag such as `[$WIN32]` or `[!$X360]` is stored without its brackets on
+//!   the entry (or directive) it follows, and is never evaluated, so an entry whose
+//!   condition is false for the caller is still in the tree. It is accepted after the key,
+//!   or after the value or closing brace; the position is kept in the layout. How Valve's
+//!   own loader treats a tag next to a directive or inside a nested include is not verified.
+//! - `/* */` comments are not part of KV1 and are not supported.
 //! - Keys are matched ASCII case-insensitively by the accessors, as Valve does. The tree
 //!   itself keeps keys exactly as written.
-//! - `#include` and `#base` at the top level become [`Directive`]s. Nothing is read from disk.
-//!   Their position relative to the roots is not kept; the writer emits them first.
-//! - A conditional tag such as `[$WIN32]` or `[!$X360]` is stored without its brackets and is
-//!   never evaluated. It is accepted after the key, or after the value or closing brace.
-//! - `/* */` comments are not part of KV1 and are not supported.
-//! - The binary form has no directives or conditions and carries typed values, see [`Value`].
-//!   The appinfo variant that replaces key names with string-table indices is not supported.
 
 #![forbid(unsafe_code)]
 
 mod binary;
+mod encoding;
 pub mod error;
+mod escape;
+mod layout;
+mod model;
 mod text_read;
 mod text_write;
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 #[cfg(test)]
 mod binary_tests;
 #[cfg(test)]
+mod build_tests;
+#[cfg(test)]
 mod model_tests;
+#[cfg(test)]
+mod real_tests;
+#[cfg(test)]
+mod roundtrip_tests;
 #[cfg(test)]
 mod text_read_tests;
 #[cfg(test)]
 mod text_write_tests;
 
+pub use encoding::Encoding;
 pub use error::{Error, Result};
-
-/// Default for [`Options::max_depth`].
-pub const DEFAULT_MAX_DEPTH: usize = 128;
-
-/// Knobs shared by the readers and writers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Options {
-    /// Decode and emit `\n \t \\ \"` in quoted text. See the crate docs.
-    pub escape_sequences: bool,
-    /// Deepest section nesting accepted. The first level of sections is depth 1.
-    pub max_depth: usize,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            escape_sequences: true,
-            max_depth: DEFAULT_MAX_DEPTH,
-        }
-    }
-}
-
-/// A parsed KV1 file: directives plus one or more root entries.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Document {
-    /// `#include` / `#base` lines, in file order.
-    pub directives: Vec<Directive>,
-    /// Top-level entries, in file order. Usually one section.
-    pub roots: Vec<Entry>,
-}
-
-/// Which directive a [`Directive`] is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DirectiveKind {
-    /// `#include "file"`
-    Include,
-    /// `#base "file"`
-    Base,
-}
-
-/// A `#include` or `#base` line. The path is reported as written, never opened.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Directive {
-    /// Which directive it is.
-    pub kind: DirectiveKind,
-    /// The file it names.
-    pub path: String,
-}
-
-/// One key with its value and optional conditional tag.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Entry {
-    /// The key, as written.
-    pub key: String,
-    /// The value.
-    pub value: Value,
-    /// Conditional tag without brackets, e.g. `$WIN32` or `!$X360`.
-    pub condition: Option<String>,
-}
-
-/// A value. Text KV1 only produces [`Value::String`] and [`Value::Section`]; the rest come
-/// from the binary form, and are written to text as their usual string form.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    /// A string.
-    String(String),
-    /// A nested section; keys may repeat.
-    Section(Vec<Entry>),
-    /// Binary type 2.
-    Int(i32),
-    /// Binary type 3.
-    Float(f32),
-    /// Binary type 4, a pointer-sized value stored as 32 bits.
-    Ptr(u32),
-    /// Binary type 5, UTF-16 on the wire.
-    WString(String),
-    /// Binary type 6, red, green, blue, alpha.
-    Color([u8; 4]),
-    /// Binary type 7.
-    UInt64(u64),
-}
-
-impl Document {
-    /// Parses KV1 text with default [`Options`].
-    pub fn parse(text: &str) -> Result<Self> {
-        Self::parse_with(text, &Options::default())
-    }
-
-    /// Parses KV1 text.
-    pub fn parse_with(text: &str, options: &Options) -> Result<Self> {
-        text_read::parse(text, options)
-    }
-
-    /// Writes Valve-layout KV1 text with default [`Options`].
-    pub fn to_text(&self) -> Result<String> {
-        self.to_text_with(&Options::default())
-    }
-
-    /// Writes Valve-layout KV1 text: tab indent, `"key"\t\t"value"`.
-    pub fn to_text_with(&self, options: &Options) -> Result<String> {
-        text_write::write(self, options)
-    }
-
-    /// Parses binary KV1 with default [`Options`].
-    pub fn from_binary(data: &[u8]) -> Result<Self> {
-        Self::from_binary_with(data, &Options::default())
-    }
-
-    /// Parses binary KV1. Only `max_depth` applies.
-    pub fn from_binary_with(data: &[u8], options: &Options) -> Result<Self> {
-        binary::read(data, options)
-    }
-
-    /// Writes binary KV1 with default [`Options`].
-    pub fn to_binary(&self) -> Result<Vec<u8>> {
-        self.to_binary_with(&Options::default())
-    }
-
-    /// Writes binary KV1. Fails if the tree has directives or conditions, which the format
-    /// cannot hold. Only `max_depth` applies.
-    pub fn to_binary_with(&self, options: &Options) -> Result<Vec<u8>> {
-        binary::write(self, options)
-    }
-
-    /// First root whose key matches, ASCII case-insensitively.
-    #[must_use]
-    pub fn get(&self, key: &str) -> Option<&Entry> {
-        find(&self.roots, key)
-    }
-}
-
-fn find<'a>(entries: &'a [Entry], key: &str) -> Option<&'a Entry> {
-    entries.iter().find(|e| e.key.eq_ignore_ascii_case(key))
-}
-
-impl Entry {
-    /// An entry with no conditional tag.
-    pub fn new(key: impl Into<String>, value: Value) -> Self {
-        Self {
-            key: key.into(),
-            value,
-            condition: None,
-        }
-    }
-
-    /// A string entry.
-    pub fn string(key: impl Into<String>, value: impl Into<String>) -> Self {
-        Self::new(key, Value::String(value.into()))
-    }
-
-    /// A section entry.
-    pub fn section(key: impl Into<String>, children: Vec<Entry>) -> Self {
-        Self::new(key, Value::Section(children))
-    }
-
-    /// Sets the conditional tag, without brackets.
-    #[must_use]
-    pub fn with_condition(mut self, condition: impl Into<String>) -> Self {
-        self.condition = Some(condition.into());
-        self
-    }
-
-    /// The text of a string or wide-string value.
-    #[must_use]
-    pub fn as_str(&self) -> Option<&str> {
-        match &self.value {
-            Value::String(s) | Value::WString(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    /// The entries of a section, empty for anything else.
-    #[must_use]
-    pub fn children(&self) -> &[Entry] {
-        match &self.value {
-            Value::Section(c) => c,
-            _ => &[],
-        }
-    }
-
-    /// First child whose key matches, ASCII case-insensitively.
-    #[must_use]
-    pub fn get(&self, key: &str) -> Option<&Entry> {
-        find(self.children(), key)
-    }
-
-    /// Every child whose key matches, in order.
-    pub fn get_all<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a Entry> {
-        self.children()
-            .iter()
-            .filter(move |e| e.key.eq_ignore_ascii_case(key))
-    }
-
-    /// The string value of the first matching child.
-    #[must_use]
-    pub fn get_str(&self, key: &str) -> Option<&str> {
-        self.get(key)?.as_str()
-    }
-
-    /// The first matching child as an integer: a decimal string, or a binary integer.
-    #[must_use]
-    pub fn get_int(&self, key: &str) -> Option<i64> {
-        match &self.get(key)?.value {
-            Value::String(s) | Value::WString(s) => s.trim().parse().ok(),
-            Value::Int(i) => Some(i64::from(*i)),
-            Value::UInt64(u) => i64::try_from(*u).ok(),
-            _ => None,
-        }
-    }
-
-    /// The first matching child as a float.
-    #[must_use]
-    pub fn get_float(&self, key: &str) -> Option<f64> {
-        match &self.get(key)?.value {
-            Value::String(s) | Value::WString(s) => s.trim().parse().ok(),
-            Value::Float(f) => Some(f64::from(*f)),
-            _ => self.get_int(key).map(|i| i as f64),
-        }
-    }
-
-    /// The first matching child as a bool: `true`/`false`, or an integer where non-zero is true.
-    #[must_use]
-    pub fn get_bool(&self, key: &str) -> Option<bool> {
-        if let Some(s) = self.get_str(key) {
-            if s.eq_ignore_ascii_case("true") {
-                return Some(true);
-            }
-            if s.eq_ignore_ascii_case("false") {
-                return Some(false);
-            }
-        }
-        self.get_int(key).map(|i| i != 0)
-    }
-}
+pub use layout::{ConditionAt, DocumentLayout, Layout, LineEnding, Quote, Spelling, Trivia};
+pub use model::{DEFAULT_MAX_DEPTH, Directive, DirectiveKind, Document, Entry, Options, Value};

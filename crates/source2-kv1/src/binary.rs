@@ -1,4 +1,6 @@
-use crate::{Document, Entry, Error, Options, Result, Value};
+use crate::encoding::decode_1252;
+use crate::layout::DocumentLayout;
+use crate::{Document, Encoding, Entry, Error, Options, Result, Value};
 
 const TYPE_SECTION: u8 = 0;
 const TYPE_STRING: u8 = 1;
@@ -9,6 +11,7 @@ const TYPE_WSTRING: u8 = 5;
 const TYPE_COLOR: u8 = 6;
 const TYPE_UINT64: u8 = 7;
 const TYPE_END: u8 = 8;
+const TYPE_INT64: u8 = 10;
 
 fn malformed(msg: impl Into<String>) -> Error {
     Error::MalformedBinary(msg.into())
@@ -18,25 +21,41 @@ struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
     max_depth: usize,
+    encoding: Encoding,
+    saw_non_utf8: bool,
 }
 
 pub(crate) fn read(data: &[u8], options: &Options) -> Result<Document> {
-    let mut r = Reader {
-        data,
-        pos: 0,
-        max_depth: options.max_depth,
-    };
-    let roots = r.entries(0)?;
-    if r.pos < data.len() {
-        return Err(malformed(format!(
-            "{} trailing bytes after the final end marker",
-            data.len() - r.pos
-        )));
+    let mut encoding = Encoding::Utf8;
+    loop {
+        let mut r = Reader {
+            data,
+            pos: 0,
+            max_depth: options.max_depth,
+            encoding,
+            saw_non_utf8: false,
+        };
+        let (roots, end_marker) = r.top_level()?;
+        if r.saw_non_utf8 {
+            encoding = Encoding::Windows1252;
+            continue;
+        }
+        if r.pos < data.len() {
+            return Err(malformed(format!(
+                "{} trailing bytes after the final end marker",
+                data.len() - r.pos
+            )));
+        }
+        return Ok(Document {
+            roots,
+            encoding,
+            layout: DocumentLayout {
+                end_marker,
+                ..DocumentLayout::default()
+            },
+            ..Document::default()
+        });
     }
-    Ok(Document {
-        directives: Vec::new(),
-        roots,
-    })
 }
 
 impl Reader<'_> {
@@ -63,16 +82,28 @@ impl Reader<'_> {
             .iter()
             .position(|&b| b == 0)
             .ok_or_else(|| malformed(format!("unterminated string at byte {}", self.pos)))?;
-        let s = std::str::from_utf8(&rest[..len])
-            .map_err(|_| malformed(format!("string at byte {} is not UTF-8", self.pos)))?
-            .to_owned();
+        let bytes = &rest[..len];
+        let s = match (self.encoding, std::str::from_utf8(bytes)) {
+            (Encoding::Utf8, Ok(s)) => s.to_owned(),
+            (Encoding::Utf8, Err(_)) => {
+                self.saw_non_utf8 = true;
+                String::new()
+            }
+            (Encoding::Windows1252, _) => decode_1252(bytes),
+        };
         self.pos += len + 1;
         Ok(s)
     }
 
+    fn top_level(&mut self) -> Result<(Vec<Entry>, bool)> {
+        let mut end_marker = false;
+        let roots = self.entries(0, &mut end_marker)?;
+        Ok((roots, end_marker))
+    }
+
     // `depth` is the nesting of the list being read; the implicit top level is 0. Only the
     // top level may end at EOF instead of an end marker.
-    fn entries(&mut self, depth: usize) -> Result<Vec<Entry>> {
+    fn entries(&mut self, depth: usize, ended: &mut bool) -> Result<Vec<Entry>> {
         if depth > self.max_depth {
             return Err(Error::TooDeep {
                 limit: self.max_depth,
@@ -82,17 +113,37 @@ impl Reader<'_> {
         loop {
             if self.pos >= self.data.len() {
                 if depth == 0 {
+                    *ended = false;
                     return Ok(out);
                 }
                 return Err(malformed("truncated inside a section"));
             }
+            let offset = self.pos;
             let ty = self.take(1)?[0];
             if ty == TYPE_END {
+                *ended = true;
                 return Ok(out);
+            }
+            if !matches!(
+                ty,
+                TYPE_SECTION
+                    | TYPE_STRING
+                    | TYPE_INT
+                    | TYPE_FLOAT
+                    | TYPE_PTR
+                    | TYPE_WSTRING
+                    | TYPE_COLOR
+                    | TYPE_UINT64
+                    | TYPE_INT64
+            ) {
+                return Err(Error::UnsupportedType {
+                    type_byte: ty,
+                    offset,
+                });
             }
             let key = self.cstring()?;
             let value = match ty {
-                TYPE_SECTION => Value::Section(self.entries(depth + 1)?),
+                TYPE_SECTION => Value::Section(self.entries(depth + 1, &mut false)?),
                 TYPE_STRING => Value::String(self.cstring()?),
                 TYPE_INT => Value::Int(i32::from_le_bytes(self.array()?)),
                 TYPE_FLOAT => Value::Float(f32::from_le_bytes(self.array()?)),
@@ -112,13 +163,9 @@ impl Reader<'_> {
                 }
                 TYPE_COLOR => Value::Color(self.array()?),
                 TYPE_UINT64 => Value::UInt64(u64::from_le_bytes(self.array()?)),
-                other => return Err(malformed(format!("unknown type byte {other}"))),
+                _ => Value::Int64(i64::from_le_bytes(self.array()?)),
             };
-            out.push(Entry {
-                key,
-                value,
-                condition: None,
-            });
+            out.push(Entry::new(key, value));
         }
     }
 }
@@ -130,21 +177,32 @@ pub(crate) fn write(doc: &Document, options: &Options) -> Result<Vec<u8>> {
         ));
     }
     let mut out = Vec::new();
-    entries(&mut out, &doc.roots, 0, options)?;
-    out.push(TYPE_END);
+    entries(&mut out, &doc.roots, 0, options, doc.encoding)?;
+    if doc.layout.end_marker {
+        out.push(TYPE_END);
+    }
     Ok(out)
 }
 
-fn cstring(out: &mut Vec<u8>, s: &str) -> Result<()> {
+fn cstring(out: &mut Vec<u8>, s: &str, encoding: Encoding) -> Result<()> {
     if s.contains('\0') {
         return Err(Error::InvalidInput(format!("{s:?} contains a NUL byte")));
     }
-    out.extend_from_slice(s.as_bytes());
+    let bytes = encoding
+        .encode(s)
+        .map_err(|c| Error::InvalidInput(format!("{c:?} cannot be written in Windows-1252")))?;
+    out.extend_from_slice(&bytes);
     out.push(0);
     Ok(())
 }
 
-fn entries(out: &mut Vec<u8>, list: &[Entry], depth: usize, options: &Options) -> Result<()> {
+fn entries(
+    out: &mut Vec<u8>,
+    list: &[Entry],
+    depth: usize,
+    options: &Options,
+    encoding: Encoding,
+) -> Result<()> {
     if depth > options.max_depth {
         return Err(Error::TooDeep {
             limit: options.max_depth,
@@ -165,15 +223,16 @@ fn entries(out: &mut Vec<u8>, list: &[Entry], depth: usize, options: &Options) -
             Value::WString(_) => TYPE_WSTRING,
             Value::Color(_) => TYPE_COLOR,
             Value::UInt64(_) => TYPE_UINT64,
+            Value::Int64(_) => TYPE_INT64,
         };
         out.push(ty);
-        cstring(out, &e.key)?;
+        cstring(out, &e.key, encoding)?;
         match &e.value {
             Value::Section(children) => {
-                entries(out, children, depth + 1, options)?;
+                entries(out, children, depth + 1, options, encoding)?;
                 out.push(TYPE_END);
             }
-            Value::String(s) => cstring(out, s)?,
+            Value::String(s) => cstring(out, s, encoding)?,
             Value::Int(i) => out.extend_from_slice(&i.to_le_bytes()),
             Value::Float(f) => out.extend_from_slice(&f.to_le_bytes()),
             Value::Ptr(p) => out.extend_from_slice(&p.to_le_bytes()),
@@ -192,6 +251,7 @@ fn entries(out: &mut Vec<u8>, list: &[Entry], depth: usize, options: &Options) -
             }
             Value::Color(c) => out.extend_from_slice(c),
             Value::UInt64(u) => out.extend_from_slice(&u.to_le_bytes()),
+            Value::Int64(i) => out.extend_from_slice(&i.to_le_bytes()),
         }
     }
     Ok(())

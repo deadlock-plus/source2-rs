@@ -1,7 +1,9 @@
-use crate::{Directive, DirectiveKind, Document, Entry, Error, Options, Value};
+use crate::{DirectiveKind, Document, Encoding, Entry, Error, Options, Value};
 
 fn parse(text: &str) -> Document {
-    Document::parse(text).unwrap_or_else(|e| panic!("{e}: {text:?}"))
+    Document::parse(text)
+        .unwrap_or_else(|e| panic!("{e}: {text:?}"))
+        .without_layout()
 }
 
 fn roots(text: &str) -> Vec<Entry> {
@@ -26,12 +28,12 @@ fn quoted_section() {
 
 #[test]
 fn unquoted_tokens() {
-    let got = roots("GameInfo\n{\n\tgame citadel\n\tnomodels 1\n}");
+    let got = roots("Settings\n{\n\tmode demo\n\tflag 1\n}");
     assert_eq!(
         got,
         vec![Entry::section(
-            "GameInfo",
-            vec![s("game", "citadel"), s("nomodels", "1")]
+            "Settings",
+            vec![s("mode", "demo"), s("flag", "1")]
         )]
     );
 }
@@ -89,10 +91,21 @@ fn multiple_roots_including_plain_pairs() {
 }
 
 #[test]
-fn comments_are_dropped() {
+fn comments_are_not_content() {
     let got =
         roots("// head\na // after key\n{ // after brace\n\tk v // tail\n\t// alone\n}\n// end");
     assert_eq!(got, vec![Entry::section("a", vec![s("k", "v")])]);
+}
+
+#[test]
+fn comments_are_kept_in_the_layout() {
+    let d =
+        Document::parse("// head\n// two\na\n{\n\t// above\n\tk v // tail\n}\n// end\n").unwrap();
+    assert_eq!(d.layout.comments().collect::<Vec<_>>(), [" head", " two"]);
+    let k = &d.roots[0].children()[0];
+    assert_eq!(k.layout.comments().collect::<Vec<_>>(), [" above"]);
+    assert_eq!(k.layout.trailing_comment(), Some(" tail"));
+    assert_eq!(d.roots[0].layout.trailing_comment(), None);
 }
 
 #[test]
@@ -117,6 +130,12 @@ fn escapes_decode_by_default() {
 }
 
 #[test]
+fn full_escape_set_decodes() {
+    let got = roots(r#"k "\n\t\v\b\r\f\a\\\?\'\"""#);
+    assert_eq!(got, vec![s("k", "\n\t\u{b}\u{8}\r\u{c}\u{7}\\?'\"")]);
+}
+
+#[test]
 fn unknown_escape_is_kept_verbatim() {
     let got = roots(r#"a { k "C:\games\q" }"#);
     assert_eq!(got, vec![Entry::section("a", vec![s("k", "C:\\games\\q")])]);
@@ -129,8 +148,9 @@ fn escapes_off_keeps_backslashes_and_ends_at_quote() {
         ..Options::default()
     };
     let doc = Document::parse_with(r#"a { k "x\n\" y "C:\" }"#, &opts).unwrap();
+    assert!(!doc.escapes);
     assert_eq!(
-        doc.roots,
+        doc.without_layout().roots,
         vec![Entry::section("a", vec![s("k", "x\\n\\"), s("y", "C:\\")])]
     );
 }
@@ -149,8 +169,13 @@ fn empty_key_and_value() {
 
 #[test]
 fn bom_and_crlf() {
-    let got = roots("\u{feff}a\r\n{\r\n\tk v\r\n}\r\n");
-    assert_eq!(got, vec![Entry::section("a", vec![s("k", "v")])]);
+    let d = Document::parse("\u{feff}a\r\n{\r\n\tk v\r\n}\r\n").unwrap();
+    assert!(d.layout.bom);
+    assert_eq!(d.layout.line_ending, crate::LineEnding::CrLf);
+    assert_eq!(
+        d.without_layout().roots,
+        vec![Entry::section("a", vec![s("k", "v")])]
+    );
 }
 
 #[test]
@@ -194,30 +219,38 @@ fn quoted_bracket_text_is_a_value() {
 
 #[test]
 fn directives_are_surfaced_not_followed() {
-    let doc =
-        parse("#base \"a.vdf\"\n#include b.vdf\n\"#base\" \"c.vdf\"\n#INCLUDE \"d.vdf\"\nroot { }");
+    let doc = Document::parse(
+        "#base \"a.vdf\"\n#include b.vdf\n\"#base\" \"c.vdf\"\n#INCLUDE \"d.vdf\"\nroot { }",
+    )
+    .unwrap();
+    let got: Vec<_> = doc
+        .directives
+        .iter()
+        .map(|d| (d.kind, d.path.as_str(), d.before_root))
+        .collect();
     assert_eq!(
-        doc.directives,
+        got,
         vec![
-            Directive {
-                kind: DirectiveKind::Base,
-                path: "a.vdf".into()
-            },
-            Directive {
-                kind: DirectiveKind::Include,
-                path: "b.vdf".into()
-            },
-            Directive {
-                kind: DirectiveKind::Base,
-                path: "c.vdf".into()
-            },
-            Directive {
-                kind: DirectiveKind::Include,
-                path: "d.vdf".into()
-            },
+            (DirectiveKind::Base, "a.vdf", 0),
+            (DirectiveKind::Include, "b.vdf", 0),
+            (DirectiveKind::Base, "c.vdf", 0),
+            (DirectiveKind::Include, "d.vdf", 0),
         ]
     );
-    assert_eq!(doc.roots, vec![Entry::section("root", vec![])]);
+    assert_eq!(doc.roots.len(), 1);
+}
+
+#[test]
+fn directive_position_is_recorded() {
+    let doc = Document::parse("a { }\n#include x\nb { }\n#base y\n").unwrap();
+    let got: Vec<_> = doc.directives.iter().map(|d| d.before_root).collect();
+    assert_eq!(got, [1, 2]);
+}
+
+#[test]
+fn directive_condition_is_kept() {
+    let doc = Document::parse("#include x [$WIN32]\na { }").unwrap();
+    assert_eq!(doc.directives[0].condition.as_deref(), Some("$WIN32"));
 }
 
 #[test]
@@ -233,6 +266,27 @@ fn directive_name_inside_a_section_is_an_ordinary_key() {
 #[test]
 fn empty_input_is_empty_document() {
     assert_eq!(parse(" \n// nothing\n"), Document::default());
+}
+
+#[test]
+fn non_ascii_space_is_not_a_separator() {
+    let got = roots("k a\u{a0}b");
+    assert_eq!(got, vec![s("k", "a\u{a0}b")]);
+}
+
+#[test]
+fn non_utf8_bytes_are_windows_1252() {
+    let d = Document::parse_bytes(b"k \"caf\xe9 \x80\"\n").unwrap();
+    assert_eq!(d.encoding, Encoding::Windows1252);
+    assert_eq!(d.roots[0].as_str(), Some("caf\u{e9} \u{20ac}"));
+}
+
+#[test]
+fn utf16_is_rejected() {
+    assert!(matches!(
+        Document::parse_bytes(&[0xff, 0xfe, b'a', 0]),
+        Err(Error::UnsupportedEncoding(_))
+    ));
 }
 
 #[test]

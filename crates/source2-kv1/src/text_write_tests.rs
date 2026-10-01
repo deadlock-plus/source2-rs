@@ -1,10 +1,7 @@
-use crate::{Directive, DirectiveKind, Document, Entry, Error, Options, Value};
+use crate::{Directive, Document, Entry, Error, Options, Quote, Value};
 
 fn doc(roots: Vec<Entry>) -> Document {
-    Document {
-        directives: vec![],
-        roots,
-    }
+    Document::new(roots)
 }
 
 fn s(k: &str, v: &str) -> Entry {
@@ -29,23 +26,20 @@ fn valve_layout() {
 
 #[test]
 fn multiple_roots_and_directives() {
-    let d = Document {
-        directives: vec![
-            Directive {
-                kind: DirectiveKind::Base,
-                path: "a.vdf".into(),
-            },
-            Directive {
-                kind: DirectiveKind::Include,
-                path: "b.vdf".into(),
-            },
-        ],
-        roots: vec![Entry::section("x", vec![]), s("y", "z")],
-    };
+    let d = Document::new(vec![Entry::section("x", vec![]), s("y", "z")])
+        .with_directive(Directive::base("a.vdf"))
+        .with_directive(Directive::include("b.vdf"));
     assert_eq!(
         d.to_text().unwrap(),
         "#base \"a.vdf\"\n#include \"b.vdf\"\n\n\"x\"\n{\n}\n\"y\"\t\t\"z\"\n"
     );
+}
+
+#[test]
+fn directive_after_roots() {
+    let d =
+        Document::new(vec![s("y", "z")]).with_directive(Directive::include("b.vdf").after_roots(1));
+    assert_eq!(d.to_text().unwrap(), "\"y\"\t\t\"z\"\n#include \"b.vdf\"\n");
 }
 
 #[test]
@@ -64,9 +58,48 @@ fn conditions() {
 }
 
 #[test]
+fn comments_in_hand_built_documents() {
+    let d = Document::new(vec![Entry::section(
+        "r",
+        vec![
+            s("a", "1")
+                .with_comment(" one")
+                .with_trailing_comment(" tail"),
+            s("b", "2"),
+        ],
+    )])
+    .with_comment(" header");
+    assert_eq!(
+        d.to_text().unwrap(),
+        "// header\n\"r\"\n{\n\t// one\n\t\"a\"\t\t\"1\" // tail\n\t\"b\"\t\t\"2\"\n}\n"
+    );
+}
+
+#[test]
+fn bare_tokens_are_written_bare_when_possible() {
+    let d = doc(vec![s("key", "value").bare(), s("two words", "x y").bare()]);
+    assert_eq!(
+        d.to_text().unwrap(),
+        "key\t\tvalue\n\"two words\"\t\t\"x y\"\n"
+    );
+    assert_eq!(d.roots[0].layout.key.quote, Quote::Bare);
+}
+
+#[test]
 fn escapes_are_written() {
-    let d = doc(vec![s("k", "a\nb\tc\"d\\e")]);
-    assert_eq!(d.to_text().unwrap(), "\"k\"\t\t\"a\\nb\\tc\\\"d\\\\e\"\n");
+    let d = doc(vec![s("k", "a\nb\tc\"d\\e\u{7}")]);
+    assert_eq!(
+        d.to_text().unwrap(),
+        "\"k\"\t\t\"a\\nb\\tc\\\"d\\\\e\\a\"\n"
+    );
+}
+
+#[test]
+fn edited_values_do_not_reuse_stale_spelling() {
+    let mut d = Document::parse(r#"k "a\?b""#).unwrap();
+    assert_eq!(d.to_text().unwrap(), r#"k "a\?b""#);
+    d.roots[0].value = Value::String("zzz".into());
+    assert_eq!(d.to_text().unwrap(), "k \"zzz\"");
 }
 
 #[test]
@@ -85,6 +118,7 @@ fn round_trips_awkward_strings() {
         "[$WIN32]",
         "caf\u{e9} \u{1f980}",
         "\\n literal",
+        "\r\u{b}\u{8}\u{c}\u{7}",
     ];
     for v in awkward {
         let d = doc(vec![Entry::section(
@@ -92,7 +126,7 @@ fn round_trips_awkward_strings() {
             vec![s(v, v), s("x", v).with_condition("$A")],
         )]);
         let back = Document::parse(&d.to_text().unwrap()).unwrap();
-        assert_eq!(back, d, "value {v:?}");
+        assert_eq!(back.without_layout(), d, "value {v:?}");
     }
 }
 
@@ -102,23 +136,24 @@ fn round_trips_with_escapes_off() {
         escape_sequences: false,
         ..Options::default()
     };
-    let d = doc(vec![s("k", "C:\\games\\q\\"), s("m", "two\nlines")]);
-    let text = d.to_text_with(&opts).unwrap();
+    let mut d = doc(vec![s("k", "C:\\games\\q\\"), s("m", "two\nlines")]);
+    d.escapes = false;
+    let text = d.to_text().unwrap();
     assert_eq!(
         text,
         "\"k\"\t\t\"C:\\games\\q\\\"\n\"m\"\t\t\"two\nlines\"\n"
     );
-    assert_eq!(Document::parse_with(&text, &opts).unwrap(), d);
+    assert_eq!(
+        Document::parse_with(&text, &opts).unwrap().without_layout(),
+        d
+    );
 }
 
 #[test]
 fn escapes_off_cannot_hold_a_quote() {
-    let opts = Options {
-        escape_sequences: false,
-        ..Options::default()
-    };
-    let d = doc(vec![s("k", "a\"b")]);
-    assert!(matches!(d.to_text_with(&opts), Err(Error::InvalidInput(_))));
+    let mut d = doc(vec![s("k", "a\"b")]);
+    d.escapes = false;
+    assert!(matches!(d.to_text(), Err(Error::InvalidInput(_))));
 }
 
 #[test]
@@ -133,20 +168,40 @@ fn bad_conditions_are_rejected() {
 }
 
 #[test]
-fn typed_values_write_as_their_string_form() {
+fn typed_values_are_an_error_not_a_silent_string() {
+    let typed = [
+        Entry::int("i", -5),
+        Entry::float("f", 1.5),
+        Entry::ptr("p", 7),
+        Entry::wstring("w", "wide"),
+        Entry::color("c", [1, 2, 3, 4]),
+        Entry::uint64("u", u64::MAX),
+        Entry::int64("l", -1),
+    ];
+    for e in typed {
+        let d = doc(vec![Entry::section("r", vec![e.clone()])]);
+        assert!(
+            matches!(d.to_text(), Err(Error::TypedValueInText { .. })),
+            "{e:?}"
+        );
+    }
+}
+
+#[test]
+fn stringified_is_the_explicit_conversion() {
     let d = doc(vec![Entry::section(
         "r",
         vec![
-            Entry::new("i", Value::Int(-5)),
-            Entry::new("f", Value::Float(1.5)),
-            Entry::new("p", Value::Ptr(7)),
-            Entry::new("w", Value::WString("wide".into())),
-            Entry::new("c", Value::Color([1, 2, 3, 4])),
-            Entry::new("u", Value::UInt64(u64::MAX)),
+            Entry::int("i", -5),
+            Entry::float("f", 1.5),
+            Entry::ptr("p", 7),
+            Entry::wstring("w", "wide"),
+            Entry::color("c", [1, 2, 3, 4]),
+            Entry::uint64("u", u64::MAX),
+            Entry::int64("l", -1),
         ],
     )]);
-    let text = d.to_text().unwrap();
-    let back = Document::parse(&text).unwrap();
+    let back = Document::parse(&d.stringified().to_text().unwrap()).unwrap();
     let r = &back.roots[0];
     assert_eq!(r.get_str("i"), Some("-5"));
     assert_eq!(r.get_str("f"), Some("1.5"));
@@ -154,6 +209,8 @@ fn typed_values_write_as_their_string_form() {
     assert_eq!(r.get_str("w"), Some("wide"));
     assert_eq!(r.get_str("c"), Some("1 2 3 4"));
     assert_eq!(r.get_str("u"), Some("18446744073709551615"));
+    assert_eq!(r.get_str("l"), Some("-1"));
+    assert!(matches!(d.roots[0].children()[0].value, Value::Int(-5)));
 }
 
 #[test]
@@ -170,4 +227,13 @@ fn writing_too_deep_is_an_error() {
         doc(vec![e]).to_text_with(&opts),
         Err(Error::TooDeep { limit: 5 })
     );
+}
+
+#[test]
+fn windows_1252_text_is_written_as_bytes() {
+    let d = Document::parse_bytes(b"k caf\xe9\r\n").unwrap();
+    assert_eq!(d.to_text_bytes().unwrap(), b"k caf\xe9\r\n");
+    let mut bad = d.clone();
+    bad.roots[0].value = Value::String("\u{1f980}".into());
+    assert!(matches!(bad.to_text_bytes(), Err(Error::InvalidInput(_))));
 }

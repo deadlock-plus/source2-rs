@@ -64,3 +64,11 @@ fn typed_binary_values_feed_the_getters() {
     assert_eq!(e.get_float("f"), Some(2.5));
     assert_eq!(e.get_bool("i"), Some(true));
 }
+
+#[test]
+fn document_get_mut_edits_a_root_in_place() {
+    let mut d = Document::parse("Root { a 1 }\nOther { b 2 }").unwrap();
+    d.get_mut("ROOT").unwrap().push(Entry::string("c", "3"));
+    assert_eq!(d.get("Root").unwrap().get_str("c"), Some("3"));
+    assert!(d.get_mut("missing").is_none());
+}

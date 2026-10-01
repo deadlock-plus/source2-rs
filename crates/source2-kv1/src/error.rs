@@ -2,6 +2,7 @@
 
 /// What went wrong reading or writing KV1.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// A quoted string was never closed.
     UnterminatedString {
@@ -42,6 +43,23 @@ pub enum Error {
     },
     /// Binary KV1 data is truncated or otherwise invalid.
     MalformedBinary(String),
+    /// A binary type byte this crate does not read. See the crate docs for the supported set.
+    UnsupportedType {
+        /// The type byte.
+        type_byte: u8,
+        /// Offset of the byte in the input.
+        offset: usize,
+    },
+    /// The text is in an encoding this crate does not read, such as UTF-16.
+    UnsupportedEncoding(&'static str),
+    /// A typed value cannot be written as text without losing its type. Call
+    /// [`Document::stringified`](crate::Document::stringified) to convert it on purpose.
+    TypedValueInText {
+        /// Key of the entry.
+        key: String,
+        /// Name of the value type, e.g. `int`.
+        kind: &'static str,
+    },
     /// The tree cannot be written in the requested format.
     InvalidInput(String),
 }
@@ -69,6 +87,17 @@ impl std::fmt::Display for Error {
             ),
             Error::TooDeep { limit } => write!(f, "sections nested deeper than {limit}"),
             Error::MalformedBinary(m) => write!(f, "malformed binary KV1: {m}"),
+            Error::UnsupportedType { type_byte, offset } => {
+                write!(
+                    f,
+                    "unsupported binary KV1 type byte {type_byte} at {offset}"
+                )
+            }
+            Error::UnsupportedEncoding(e) => write!(f, "unsupported text encoding: {e}"),
+            Error::TypedValueInText { key, kind } => write!(
+                f,
+                "{key:?} is a typed {kind} value; text KV1 has no types (see Document::stringified)"
+            ),
             Error::InvalidInput(m) => write!(f, "cannot write KV1: {m}"),
         }
     }
