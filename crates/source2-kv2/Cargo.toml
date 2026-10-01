@@ -1,0 +1,15 @@
+[package]
+name = "source2-kv2"
+description = "Reader and writer for Valve's KeyValues2 / DMX (Datamodel eXchange), text and binary"
+keywords = ["source2", "kv2", "dmx", "valve"]
+categories = ["game-development", "parser-implementations"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[lints]
+workspace = true
