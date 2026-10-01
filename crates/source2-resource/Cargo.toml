@@ -1,8 +1,8 @@
 [package]
 name = "source2-resource"
-description = "Reader for Source 2 compiled-resource containers"
-keywords = ["source2", "valve", "resource", "vdata"]
-categories = ["game-development", "parser-implementations"]
+description = "Reader and writer for the Source 2 compiled-resource container (header version 12, byte-exact round trip; block contents are opaque)"
+keywords = ["source2", "valve", "resource", "container"]
+categories = ["game-development", "parser-implementations", "encoding"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

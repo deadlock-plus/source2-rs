@@ -1,15 +1,15 @@
-//! Source 2 compiled-resource containers.
-//!
-//! Everything the engine compiles - `.vdata_c`, `.vtex_c`, `.vmdl_c` - shares one envelope:
-//! a short header, then a table of four-character blocks. See [`resource`] for the layout.
-
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod kind;
 pub mod resource;
 
 pub use error::{Error, Result};
-pub use resource::{Block, Resource};
+pub use kind::BlockKind;
+pub use resource::{Block, HEADER_VERSION, Padding, Resource, Versions};
 
+#[cfg(test)]
+mod real_tests;
 #[cfg(test)]
 mod tests;

@@ -1,161 +1,314 @@
-//! Source 2 compiled-resource containers.
-//!
-//! Everything the game compiles - `.vdata_c`, `.vtex_c`, `.vmdl_c` - shares one envelope:
-//! a short header, then a table of four-character blocks. `scripts/heroes.vdata_c` carries
-//! four of them:
-//!
-//! | Block | What it is |
-//! |---|---|
-//! | `RERL` | External references - other resources this one points at |
-//! | `RED2` | Edit info: the compiler inputs and settings |
-//! | `DATA` | The payload. For a `vdata_c` this is binary KV3 |
-//! | `FLCI` | A per-field index the engine uses for fast lookup |
-//!
-//! Only [`Block::DATA`] matters for reading game data; the rest are recorded so a caller
-//! can see what a resource actually contains.
-//!
-//! Offsets inside the table are relative to the field holding them, not the file, which
-//! is the detail that makes a naive parser read garbage.
+//! The compiled-resource model, reader and writer.
+
+use std::io::{Read, Write};
 
 use crate::error::{Error, Result};
+use crate::kind::BlockKind;
 
-/// Bytes of the fixed header before the block table.
-const HEADER_LEN: usize = 8;
+/// The only header version this crate reads and writes.
+pub const HEADER_VERSION: u16 = 12;
 
-/// One block in a compiled resource.
+/// Bytes of the fixed header: size, versions, table offset, block count.
+const HEADER_LEN: usize = 16;
+/// Bytes of one table entry: tag, offset, length.
+const ENTRY_LEN: usize = 12;
+/// Alignment of automatically padded blocks.
+const AUTO_ALIGN: usize = 16;
+
+/// The two version numbers in the header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Versions {
+    /// Container layout version. Only `12` is supported.
+    pub header: u16,
+    /// Per-type revision of the contents. Stored as given.
+    pub resource: u16,
+}
+
+impl Default for Versions {
+    fn default() -> Self {
+        Versions {
+            header: HEADER_VERSION,
+            resource: 0,
+        }
+    }
+}
+
+/// Bytes between the end of the previous section and the start of a block.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Padding {
+    /// Zero bytes up to the next 16-byte boundary of the file.
+    #[default]
+    Auto,
+    /// Exactly these bytes.
+    Exact(Vec<u8>),
+}
+
+/// One block: a tag and its bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Block {
-    /// Four-character tag, e.g. `DATA`.
-    pub kind: [u8; 4],
-    /// Offset of the block's bytes from the start of the resource.
-    pub offset: usize,
-    /// Length of the block in bytes.
-    pub length: usize,
+    /// The block's tag.
+    pub kind: BlockKind,
+    /// The block's bytes, opaque to this crate.
+    pub data: Vec<u8>,
+    /// Padding written before the block. Offsets and lengths are derived when writing.
+    pub padding: Padding,
 }
 
 impl Block {
-    /// The payload block of a compiled resource.
-    pub const DATA: [u8; 4] = *b"DATA";
-    /// External resource references.
-    pub const RERL: [u8; 4] = *b"RERL";
-    /// Edit info, version 2.
-    pub const RED2: [u8; 4] = *b"RED2";
-
-    /// The tag as text, for logs and errors.
-    pub fn name(&self) -> String {
-        String::from_utf8_lossy(&self.kind).into_owned()
+    /// A block with default padding.
+    pub fn new(kind: BlockKind, data: Vec<u8>) -> Self {
+        Block {
+            kind,
+            data,
+            padding: Padding::Auto,
+        }
     }
 }
 
-/// A parsed compiled-resource container.
-#[derive(Clone, Debug)]
-pub struct Resource<'a> {
-    bytes: &'a [u8],
-    header_version: u16,
-    resource_version: u16,
-    blocks: Vec<Block>,
+/// A compiled-resource container.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Resource {
+    /// Header and resource versions.
+    pub versions: Versions,
+    /// Blocks in table order. Their bytes are laid out in the same order.
+    pub blocks: Vec<Block>,
+    /// Bytes between the 16-byte header and the block table.
+    pub pre_table: Vec<u8>,
+    /// Bytes after the last block, outside the stored size.
+    pub trailing: Vec<u8>,
+    /// The size field when it differs from the end of the last block. `None` writes the
+    /// end of the last block, which is what real files store.
+    pub declared_size: Option<u32>,
 }
 
-impl<'a> Resource<'a> {
-    /// Parse the header and block table of a compiled resource.
+fn auto_padding(cursor: u64) -> usize {
+    let align = AUTO_ALIGN as u64;
+    ((align - cursor % align) % align) as usize
+}
+
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+fn u16_at(b: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([b[at], b[at + 1]])
+}
+
+fn to_u32(value: u64, what: &'static str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| Error::TooLarge { what })
+}
+
+impl Resource {
+    /// An empty resource with default versions.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a block with default padding and return it.
+    pub fn push_block(&mut self, kind: BlockKind, data: Vec<u8>) -> &mut Block {
+        self.blocks.push(Block::new(kind, data));
+        let last = self.blocks.len() - 1;
+        &mut self.blocks[last]
+    }
+
+    /// The first block with this tag.
+    pub fn block(&self, kind: BlockKind) -> Option<&Block> {
+        self.blocks.iter().find(|b| b.kind == kind)
+    }
+
+    /// The bytes of the first `DATA` block.
+    pub fn data(&self) -> Option<&[u8]> {
+        self.block(BlockKind::DATA).map(|b| b.data.as_slice())
+    }
+
+    /// Parse a compiled resource.
+    ///
+    /// Every byte of `bytes` ends up in the model, so [`Resource::to_bytes`] reproduces
+    /// the input.
     ///
     /// # Errors
     ///
-    /// If the file is too short, its self-reported size disagrees with its actual length,
-    /// or a block points outside it.
-    pub fn parse(bytes: &'a [u8]) -> Result<Self> {
-        if bytes.len() < 16 {
-            return Err(Error::Malformed(format!(
-                "resource is {} bytes, too short for a header",
-                bytes.len()
-            )));
+    /// [`Error::Truncated`] when the header or table does not fit,
+    /// [`Error::UnsupportedVersion`] for a header version other than 12,
+    /// [`Error::BadOffset`] when a block runs past the end, and [`Error::BadLayout`] for
+    /// tables the model cannot represent.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let available = bytes.len() as u64;
+        if bytes.len() < HEADER_LEN {
+            return Err(Error::Truncated {
+                what: "header",
+                needed: HEADER_LEN as u64,
+                available,
+            });
         }
-        let u32_at =
-            |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
-        let u16_at = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
-
-        // A compiled resource states its own size first. Checking it here turns "this is
-        // not actually a resource" into a clear error instead of a nonsense block table.
-        let file_size = u32_at(0) as usize;
-        if file_size != bytes.len() {
-            return Err(Error::Malformed(format!(
-                "resource says {file_size} bytes, got {}",
-                bytes.len()
-            )));
-        }
-        let header_version = u16_at(4);
-        let resource_version = u16_at(6);
-
-        // Both of these are relative to their own position, not the file start.
-        let block_offset = u32_at(8) as usize + HEADER_LEN;
-        let block_count = u32_at(12) as usize;
-
-        let mut blocks = Vec::with_capacity(block_count);
-        for i in 0..block_count {
-            let at = block_offset + i * 12;
-            if at + 12 > bytes.len() {
-                return Err(Error::Malformed(format!(
-                    "block {i} of {block_count} runs past the end"
-                )));
-            }
-            let kind = [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]];
-            // The offset is written relative to the field that holds it.
-            let offset = at + 4 + u32_at(at + 4) as usize;
-            let length = u32_at(at + 8) as usize;
-            if offset
-                .checked_add(length)
-                .is_none_or(|end| end > bytes.len())
-            {
-                return Err(Error::Malformed(format!(
-                    "block {} spans {offset}..{} of {} bytes",
-                    String::from_utf8_lossy(&kind),
-                    offset.saturating_add(length),
-                    bytes.len()
-                )));
-            }
-            blocks.push(Block {
-                kind,
-                offset,
-                length,
+        let size = u32_at(bytes, 0);
+        let versions = Versions {
+            header: u16_at(bytes, 4),
+            resource: u16_at(bytes, 6),
+        };
+        if versions.header != HEADER_VERSION {
+            return Err(Error::UnsupportedVersion {
+                found: versions.header,
             });
         }
 
+        // The table offset is relative to its own field at byte 8.
+        let table_rel = u64::from(u32_at(bytes, 8));
+        let count = u64::from(u32_at(bytes, 12));
+        if table_rel < 8 {
+            return Err(Error::BadLayout {
+                index: None,
+                reason: "block table overlaps the header",
+            });
+        }
+        let table_start = 8 + table_rel;
+        // Checking the table against the input length bounds `count` before any allocation.
+        let table_end = count
+            .checked_mul(ENTRY_LEN as u64)
+            .and_then(|t| t.checked_add(table_start))
+            .filter(|&end| end <= available)
+            .ok_or(Error::Truncated {
+                what: "block table",
+                needed: count
+                    .saturating_mul(ENTRY_LEN as u64)
+                    .saturating_add(table_start),
+                available,
+            })?;
+
+        // Both casts are bounded by `available`.
+        let table_start = table_start as usize;
+        let mut cursor = table_end as usize;
+        let mut blocks = Vec::with_capacity(count as usize);
+        for index in 0..count as usize {
+            let entry = table_start + index * ENTRY_LEN;
+            let kind = BlockKind([
+                bytes[entry],
+                bytes[entry + 1],
+                bytes[entry + 2],
+                bytes[entry + 3],
+            ]);
+            // The offset is relative to the field that holds it.
+            let offset = (entry as u64 + 4) + u64::from(u32_at(bytes, entry + 4));
+            let length = u64::from(u32_at(bytes, entry + 8));
+            if offset < cursor as u64 {
+                return Err(Error::BadLayout {
+                    index: Some(index),
+                    reason: "block starts before the end of the table or the previous block",
+                });
+            }
+            let end = offset + length;
+            if end > available {
+                return Err(Error::BadOffset {
+                    index,
+                    kind,
+                    offset,
+                    length,
+                    available,
+                });
+            }
+            let (offset, end) = (offset as usize, end as usize);
+            let gap = &bytes[cursor..offset];
+            let padding = if gap.len() == auto_padding(cursor as u64) && gap.iter().all(|&b| b == 0)
+            {
+                Padding::Auto
+            } else {
+                Padding::Exact(gap.to_vec())
+            };
+            blocks.push(Block {
+                kind,
+                data: bytes[offset..end].to_vec(),
+                padding,
+            });
+            cursor = end;
+        }
+
         Ok(Resource {
-            bytes,
-            header_version,
-            resource_version,
+            versions,
             blocks,
+            pre_table: bytes[HEADER_LEN..table_start].to_vec(),
+            trailing: bytes[cursor..].to_vec(),
+            declared_size: (u64::from(size) != cursor as u64).then_some(size),
         })
     }
 
-    /// Header format version. `12` for everything Deadlock ships.
-    pub fn header_version(&self) -> u16 {
-        self.header_version
-    }
-
-    /// Resource format version.
-    pub fn resource_version(&self) -> u16 {
-        self.resource_version
-    }
-
-    /// Every block, in the order the table lists them.
-    pub fn blocks(&self) -> &[Block] {
-        &self.blocks
-    }
-
-    /// The bytes of a block by tag, e.g. `*b"DATA"`.
-    pub fn block(&self, kind: [u8; 4]) -> Option<&'a [u8]> {
-        let b = self.blocks.iter().find(|b| b.kind == kind)?;
-        Some(&self.bytes[b.offset..b.offset + b.length])
-    }
-
-    /// The payload block, which is what a caller almost always wants.
+    /// Read a whole compiled resource from `reader`.
     ///
     /// # Errors
     ///
-    /// If the resource has no `DATA` block.
-    pub fn data(&self) -> Result<&'a [u8]> {
-        self.block(Block::DATA)
-            .ok_or_else(|| Error::Malformed("resource has no DATA block".into()))
+    /// I/O failures, and everything [`Resource::parse`] reports.
+    pub fn read<R: Read>(mut reader: R) -> Result<Self> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        Self::parse(&bytes)
+    }
+
+    /// Serialize to `writer`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedVersion`] for a header version other than 12,
+    /// [`Error::TooLarge`] when an offset or length overflows 32 bits, and I/O failures.
+    pub fn write<W: Write>(&self, mut writer: W) -> Result<()> {
+        if self.versions.header != HEADER_VERSION {
+            return Err(Error::UnsupportedVersion {
+                found: self.versions.header,
+            });
+        }
+        let table_start = (HEADER_LEN + self.pre_table.len()) as u64;
+        let table_rel = to_u32(table_start - 8, "table offset")?;
+        let count = to_u32(self.blocks.len() as u64, "block count")?;
+
+        let mut cursor = table_start + self.blocks.len() as u64 * ENTRY_LEN as u64;
+        let mut table = Vec::with_capacity(self.blocks.len() * ENTRY_LEN);
+        let mut gaps = Vec::with_capacity(self.blocks.len());
+        for (index, block) in self.blocks.iter().enumerate() {
+            let gap_len = match &block.padding {
+                Padding::Auto => auto_padding(cursor),
+                Padding::Exact(bytes) => bytes.len(),
+            };
+            let start = cursor + gap_len as u64;
+            let entry = table_start + (index * ENTRY_LEN) as u64;
+            let rel = to_u32(start - (entry + 4), "block offset")?;
+            let length = to_u32(block.data.len() as u64, "block length")?;
+            table.extend_from_slice(block.kind.as_bytes());
+            table.extend_from_slice(&rel.to_le_bytes());
+            table.extend_from_slice(&length.to_le_bytes());
+            gaps.push(gap_len);
+            cursor = start + u64::from(length);
+        }
+        let size = match self.declared_size {
+            Some(size) => size,
+            None => to_u32(cursor, "resource size")?,
+        };
+
+        let mut header = [0u8; HEADER_LEN];
+        header[0..4].copy_from_slice(&size.to_le_bytes());
+        header[4..6].copy_from_slice(&self.versions.header.to_le_bytes());
+        header[6..8].copy_from_slice(&self.versions.resource.to_le_bytes());
+        header[8..12].copy_from_slice(&table_rel.to_le_bytes());
+        header[12..16].copy_from_slice(&count.to_le_bytes());
+        writer.write_all(&header)?;
+        writer.write_all(&self.pre_table)?;
+        writer.write_all(&table)?;
+        for (block, &gap_len) in self.blocks.iter().zip(&gaps) {
+            match &block.padding {
+                Padding::Auto => writer.write_all(&[0u8; AUTO_ALIGN][..gap_len])?,
+                Padding::Exact(bytes) => writer.write_all(bytes)?,
+            }
+            writer.write_all(&block.data)?;
+        }
+        writer.write_all(&self.trailing)?;
+        Ok(())
+    }
+
+    /// Serialize to a new buffer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resource::write`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.write(&mut out)?;
+        Ok(out)
     }
 }
