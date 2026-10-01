@@ -40,12 +40,12 @@ if let Some(data) = resource.data() {
 ## Write and round trip
 
 ```rust
-use source2_resource::{BlockKind, Resource};
+use source2_resource::{Block, BlockKind, HEADER_VERSION, Resource, Versions};
 
-let mut resource = Resource::new();
-resource.versions.resource = 1;
-resource.push_block(BlockKind::RERL, b"refs".to_vec());
-resource.push_block(BlockKind::DATA, b"payload".to_vec());
+let resource = Resource::new()
+    .with_versions(Versions::new(HEADER_VERSION, 1))
+    .with_block(Block::new(BlockKind::RERL, b"refs".to_vec()))
+    .with_block(Block::new(BlockKind::DATA, b"payload".to_vec()));
 
 let bytes = resource.to_bytes()?;
 assert_eq!(Resource::parse(&bytes)?, resource);
@@ -66,7 +66,10 @@ assert_eq!(resource.to_bytes()?, original);
 
 ## Edit
 
-Fields are public. Change a block's bytes, add or remove blocks, then write. Offsets and
+Fields are public and can be assigned. `Resource`, `Block`, `Versions` and `Padding` are
+`non_exhaustive`, so build them with `Resource::new`, `Block::new`, `Versions::new` or
+`Default` and the `with_*` builders rather than struct literals, and give `match` on
+`Padding` a wildcard arm. Change a block's bytes, add or remove blocks, then write. Offsets and
 lengths are derived on write, and padding defaults to zeros up to a 16-byte boundary.
 
 ```rust

@@ -17,11 +17,22 @@ const AUTO_ALIGN: usize = 16;
 
 /// The two version numbers in the header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Versions {
     /// Container layout version. Only `12` is supported.
     pub header: u16,
     /// Per-type revision of the contents. Stored as given.
     pub resource: u16,
+}
+
+impl Versions {
+    /// Versions with the given header and resource numbers.
+    ///
+    /// The struct is `non_exhaustive`, so outside this crate it is built with this
+    /// constructor or [`Versions::default`] and then edited through its public fields.
+    pub const fn new(header: u16, resource: u16) -> Self {
+        Versions { header, resource }
+    }
 }
 
 impl Default for Versions {
@@ -34,7 +45,10 @@ impl Default for Versions {
 }
 
 /// Bytes between the end of the previous section and the start of a block.
+///
+/// `non_exhaustive`: matches outside this crate need a wildcard arm.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Padding {
     /// Zero bytes up to the next 16-byte boundary of the file.
     #[default]
@@ -44,7 +58,11 @@ pub enum Padding {
 }
 
 /// One block: a tag and its bytes.
+///
+/// `non_exhaustive`: outside this crate, build it with [`Block::new`] and
+/// [`Block::with_padding`], or assign the public fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Block {
     /// The block's tag.
     pub kind: BlockKind,
@@ -63,10 +81,21 @@ impl Block {
             padding: Padding::Auto,
         }
     }
+
+    /// Set the padding written before the block.
+    #[must_use]
+    pub fn with_padding(mut self, padding: Padding) -> Self {
+        self.padding = padding;
+        self
+    }
 }
 
 /// A compiled-resource container.
+///
+/// `non_exhaustive`: outside this crate, start from [`Resource::new`] and use the
+/// `with_*` builders or assign the public fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Resource {
     /// Header and resource versions.
     pub versions: Versions,
@@ -102,6 +131,41 @@ impl Resource {
     /// An empty resource with default versions.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace the header and resource versions.
+    #[must_use]
+    pub fn with_versions(mut self, versions: Versions) -> Self {
+        self.versions = versions;
+        self
+    }
+
+    /// Append a block.
+    #[must_use]
+    pub fn with_block(mut self, block: Block) -> Self {
+        self.blocks.push(block);
+        self
+    }
+
+    /// Set the bytes between the header and the block table.
+    #[must_use]
+    pub fn with_pre_table(mut self, pre_table: Vec<u8>) -> Self {
+        self.pre_table = pre_table;
+        self
+    }
+
+    /// Set the bytes after the last block.
+    #[must_use]
+    pub fn with_trailing(mut self, trailing: Vec<u8>) -> Self {
+        self.trailing = trailing;
+        self
+    }
+
+    /// Set the size field to write instead of the end of the last block.
+    #[must_use]
+    pub fn with_declared_size(mut self, declared_size: Option<u32>) -> Self {
+        self.declared_size = declared_size;
+        self
     }
 
     /// Append a block with default padding and return it.
