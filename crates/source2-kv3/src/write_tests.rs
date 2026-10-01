@@ -419,3 +419,70 @@ fn the_shape_counts_match_what_shipped_files_state() {
         }
     }
 }
+
+/// Bytes with no short-range repetition, so only a long-range match can shrink them.
+fn noise(len: usize) -> Vec<u8> {
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 32) as u8
+        })
+        .collect()
+}
+
+#[cfg(feature = "lz4")]
+#[test]
+fn lz4_shrinks_a_redundant_document() {
+    let value = object(vec![(
+        "zeros",
+        Value::Array((0..5000).map(|_| Value::Int(7)).collect()),
+    )]);
+    for version in [Version::V4, Version::V5] {
+        let plain = write(&value, &options(version, Compression::None)).expect("write");
+        let packed = write(&value, &options(version, Compression::Lz4)).expect("write");
+        assert!(
+            packed.len() < plain.len() / 2,
+            "{version:?}: {} B packed vs {} B plain",
+            packed.len(),
+            plain.len()
+        );
+        round_trip(&value, version, Compression::Lz4);
+    }
+}
+
+#[cfg(feature = "lz4")]
+#[test]
+fn lz4_shrinks_repetitive_blobs() {
+    let plain = write(&blobs(), &options(Version::V5, Compression::None)).expect("write");
+    let packed = write(&blobs(), &options(Version::V5, Compression::Lz4)).expect("write");
+    assert!(
+        packed.len() < plain.len() / 2,
+        "{} B packed vs {} B plain",
+        packed.len(),
+        plain.len()
+    );
+}
+
+#[cfg(feature = "lz4")]
+#[test]
+fn lz4_blob_chunks_match_against_earlier_output() {
+    let pattern = noise(20_000);
+    let twice: Vec<u8> = pattern.iter().chain(&pattern).copied().collect();
+    let value = object(vec![
+        ("first", Value::Blob(pattern.clone())),
+        ("second", Value::Blob(pattern)),
+        ("both", Value::Blob(twice)),
+    ]);
+    let plain = write(&value, &options(Version::V5, Compression::None)).expect("write");
+    let packed = write(&value, &options(Version::V5, Compression::Lz4)).expect("write");
+    assert!(
+        packed.len() < plain.len() * 2 / 5,
+        "{} B packed vs {} B plain",
+        packed.len(),
+        plain.len()
+    );
+    round_trip(&value, Version::V5, Compression::Lz4);
+}

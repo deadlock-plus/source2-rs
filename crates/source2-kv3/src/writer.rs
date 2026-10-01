@@ -22,9 +22,7 @@
 //! # Compression
 //!
 //! zstd is written with `ruzstd`'s fastest level, one frame per buffer on v5. LZ4 is
-//! written as a single literal run per buffer: a valid block that every LZ4 decoder
-//! accepts, but one that does not shrink the data. `lz4_flex`'s encoder is behind a
-//! feature this workspace does not enable.
+//! written with `lz4_flex`, one block per buffer.
 
 use std::collections::HashMap;
 
@@ -494,11 +492,13 @@ fn blob_area(blobs: &[Vec<u8>], compression: Compression) -> Result<(Vec<u8>, Ve
     let area = match compression {
         Compression::Lz4 => {
             let mut area = Vec::new();
+            let mut stream: Vec<u8> = Vec::new();
             for chunk in blobs
                 .iter()
                 .flat_map(|b| b.chunks(usize::from(LZ4_FRAME_SIZE)))
             {
-                let block = compress_lz4(chunk)?;
+                let block = compress_lz4_chunk(chunk, &stream)?;
+                stream.extend_from_slice(chunk);
                 chunk_sizes.push(u16::try_from(block.len()).map_err(|_| {
                     Error::Malformed("KV3 blob chunk does not fit a 16-bit length".into())
                 })?);
@@ -522,27 +522,22 @@ fn compress(raw: &[u8], compression: Compression) -> Result<Vec<u8>> {
     }
 }
 
-/// One LZ4 block holding `raw` as a single literal run.
-///
-/// A block made only of literals is complete and valid, because the format's last
-/// sequence carries literals and no match. The token's high nibble is the literal count,
-/// or 15 with the remainder following as 255-valued continuation bytes.
 #[cfg(feature = "lz4")]
 fn compress_lz4(raw: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(raw.len() + raw.len() / 255 + 2);
-    if raw.len() < 15 {
-        out.push((raw.len() as u8) << 4);
-    } else {
-        out.push(0xF0);
-        let mut rest = raw.len() - 15;
-        while rest >= 255 {
-            out.push(255);
-            rest -= 255;
-        }
-        out.push(rest as u8);
-    }
-    out.extend_from_slice(raw);
-    Ok(out)
+    Ok(lz4_flex::block::compress(raw))
+}
+
+/// One blob chunk, free to match against the last 64 KiB of the chunks before it, which
+/// is the window the reader decodes it against.
+#[cfg(feature = "lz4")]
+fn compress_lz4_chunk(chunk: &[u8], stream: &[u8]) -> Result<Vec<u8>> {
+    let window = &stream[stream.len().saturating_sub(crate::LZ4_WINDOW)..];
+    Ok(lz4_flex::block::compress_with_dict(chunk, window))
+}
+
+#[cfg(not(feature = "lz4"))]
+fn compress_lz4_chunk(_chunk: &[u8], _stream: &[u8]) -> Result<Vec<u8>> {
+    compress_lz4(&[])
 }
 
 #[cfg(not(feature = "lz4"))]

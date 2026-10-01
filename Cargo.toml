@@ -20,7 +20,7 @@ source2-vpk = { version = "0.1.0", path = "crates/source2-vpk" }
 # Pure Rust so `forbid(unsafe_code)` holds and no C toolchain is needed to cross-compile.
 # KV3 stores LZ4 blocks, not frames, so `frame` is dropped along with its transitive
 # `twox-hash`. `safe-decode` and `checked-decode` keep it free of `unsafe`.
-lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode", "checked-decode", "std"] }
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode", "checked-decode", "safe-encode", "std"] }
 ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
