@@ -282,18 +282,21 @@ fn pairings_no_file_uses_are_refused() {
 }
 
 #[test]
-fn blobs_need_a_revision_with_somewhere_to_put_them() {
+fn every_revision_can_hold_a_blob() {
     let tree = root(vec![
         ("b", Value::blob(vec![1, 2, 3])),
         ("e", Value::blob(vec![])),
     ]);
-    for version in [Version::Legacy, Version::V1, Version::V2, Version::V5] {
+    for version in [
+        Version::Legacy,
+        Version::V1,
+        Version::V2,
+        Version::V3,
+        Version::V4,
+        Version::V5,
+    ] {
         let block = write(&tree, &options(version, Compression::None)).unwrap();
         assert_eq!(parse(&block).unwrap().root, tree, "{version:?}");
-    }
-    for version in [Version::V3, Version::V4] {
-        let err = write(&tree, &options(version, Compression::None)).unwrap_err();
-        assert!(matches!(err, Error::Invalid(_)), "{version:?}: {err}");
     }
 }
 

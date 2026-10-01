@@ -86,7 +86,7 @@ fn blob_file(tail: &Tail, compression: Compression, frame_size: u16) -> Vec<u8> 
     out
 }
 
-/// One independently compressed literal block per blob.
+/// One independently compressed literal block per blob; an empty blob has no chunk.
 fn lz4_tail(blobs: &[&[u8]]) -> Tail {
     let mut tail = Tail {
         sizes: Vec::new(),
@@ -94,8 +94,11 @@ fn lz4_tail(blobs: &[&[u8]]) -> Tail {
         area: Vec::new(),
     };
     for b in blobs {
-        let block = crate::tests::lz4_literal_block(b);
         tail.sizes.push(b.len() as u32);
+        if b.is_empty() {
+            continue;
+        }
+        let block = crate::tests::lz4_literal_block(b);
         tail.chunk_sizes.push(block.len() as u16);
         tail.area.extend(block);
     }
@@ -166,4 +169,143 @@ fn an_lz4_chunk_may_copy_from_the_chunk_before() {
         parse(&file).expect("parse").root,
         expected(&[b"abcdefghabcd"])
     );
+}
+
+/// A v4 file: one buffer holding the pools, the strings and types, then the blob lengths and a
+/// trailer and on LZ4 the chunk lengths, followed by the blob area and a closing trailer. The
+/// header counts the blobs at the same offsets v5 does and states a compressed size that stops
+/// before the blob area.
+fn v4_blob_file(tail: &Tail, compression: Compression, frame_size: u16) -> Vec<u8> {
+    let n = tail.sizes.len();
+    let mut types = vec![9u8];
+    types.extend(std::iter::repeat_n(7u8, n));
+    let mut ints = vec![1, n as u32];
+    ints.extend(vec![0; n]);
+
+    let mut payload = words(&ints);
+    payload.resize(payload.len().next_multiple_of(8), 0);
+    let region = b"k\0".len() + types.len();
+    payload.extend(b"k\0");
+    payload.extend(&types);
+    payload.extend(words(&tail.sizes));
+    payload.extend(words(&[0xFFEE_DD00]));
+    for s in &tail.chunk_sizes {
+        payload.extend(s.to_le_bytes());
+    }
+    let packed = match compression {
+        Compression::Lz4 => crate::tests::lz4_literal_block(&payload),
+        Compression::Zstd => ruzstd::encoding::compress_to_vec(
+            &*payload,
+            ruzstd::encoding::CompressionLevel::Fastest,
+        ),
+        _ => payload.clone(),
+    };
+    // Only zstd counts the blob frames in the compressed size.
+    let stated = packed.len()
+        + if compression == Compression::Zstd {
+            tail.area.len()
+        } else {
+            0
+        };
+
+    let mut h = vec![0u8; 72];
+    let put = |h: &mut Vec<u8>, at: usize, v: u32| h[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    put(&mut h, 0, crate::MAGIC_V4);
+    put(
+        &mut h,
+        20,
+        match compression {
+            Compression::Lz4 => 1,
+            Compression::Zstd => 2,
+            _ => 0,
+        },
+    );
+    h[26..28].copy_from_slice(&frame_size.to_le_bytes());
+    put(&mut h, 32, ints.len() as u32);
+    put(&mut h, 40, region as u32);
+    put(&mut h, 48, payload.len() as u32);
+    put(&mut h, 52, stated as u32);
+    put(&mut h, 56, n as u32);
+    put(&mut h, 60, tail.sizes.iter().sum());
+
+    let mut out = h;
+    out.extend(packed);
+    out.extend(&tail.area);
+    out.extend(words(&[0xFFEE_DD00]));
+    out
+}
+
+#[test]
+fn v4_lz4_blobs_after_the_buffer_are_read() {
+    let blobs: [&[u8]; 2] = [b"abc", b"hello world"];
+    let file = v4_blob_file(&lz4_tail(&blobs), Compression::Lz4, 16384);
+    assert_eq!(parse(&file).expect("parse").root, expected(&blobs));
+}
+
+#[test]
+fn v4_zstd_blobs_after_the_buffer_are_read() {
+    let blobs: [&[u8]; 2] = [b"abc", b"hello world"];
+    let tail = Tail {
+        sizes: blobs.iter().map(|b| b.len() as u32).collect(),
+        chunk_sizes: Vec::new(),
+        area: ruzstd::encoding::compress_to_vec(
+            blobs.concat().as_slice(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        ),
+    };
+    let file = v4_blob_file(&tail, Compression::Zstd, 0);
+    assert_eq!(parse(&file).expect("parse").root, expected(&blobs));
+}
+
+#[test]
+fn v4_uncompressed_blobs_after_the_buffer_are_read() {
+    let blobs: [&[u8]; 2] = [b"abc", b"hello world"];
+    let tail = Tail {
+        sizes: blobs.iter().map(|b| b.len() as u32).collect(),
+        chunk_sizes: Vec::new(),
+        area: blobs.concat(),
+    };
+    let file = v4_blob_file(&tail, Compression::None, 0);
+    assert_eq!(parse(&file).expect("parse").root, expected(&blobs));
+}
+
+#[test]
+fn v4_blobs_survive_a_rewrite() {
+    let blobs: [&[u8]; 2] = [b"abc", b"hello world"];
+    for (compression, tail) in [
+        (Compression::Lz4, lz4_tail(&blobs)),
+        (
+            Compression::None,
+            Tail {
+                sizes: blobs.iter().map(|b| b.len() as u32).collect(),
+                chunk_sizes: Vec::new(),
+                area: blobs.concat(),
+            },
+        ),
+    ] {
+        let file = v4_blob_file(&tail, compression, 16384);
+        let doc = parse(&file).expect("parse");
+        let again = parse(&doc.to_bytes().expect("write")).expect("reparse");
+        assert_eq!(again.root, expected(&blobs));
+    }
+}
+
+/// An empty blob has no chunks, so a v5 file whose only blob is empty has an empty chunk table
+/// and a blob total of zero.
+#[test]
+fn an_empty_lz4_blob_has_no_chunks() {
+    let tail = Tail {
+        sizes: vec![0],
+        chunk_sizes: Vec::new(),
+        area: Vec::new(),
+    };
+    let file = blob_file(&tail, Compression::Lz4, 16384);
+    assert_eq!(parse(&file).expect("parse").root, expected(&[b""]));
+}
+
+#[test]
+fn an_empty_lz4_blob_may_sit_beside_others() {
+    let blobs: [&[u8]; 3] = [b"abc", b"", b"hello"];
+    let file = blob_file(&lz4_tail(&blobs), Compression::Lz4, 16384);
+    assert_eq!(parse(&file).expect("parse").root, expected(&blobs));
 }

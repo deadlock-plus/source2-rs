@@ -13,7 +13,10 @@
 //!
 //! A v4 payload is one buffer. Offsets 72 onwards are not a shorter form of the same fields,
 //! they are where the payload starts, so the four per-buffer sizes read zero and 48/52 are the
-//! only lengths there are.
+//! only lengths there are. Offsets 56 and 60, the blob count and total, sit inside the v4 header
+//! and mean what they do in v5. With blobs, `compressed_size` (or `uncompressed_size` when
+//! stored) stops before the blob area, so the buffer's end is the header's length plus that
+//! figure and the blob area is whatever follows it.
 //!
 //! # Why the compression paths differ
 //!
@@ -37,6 +40,7 @@
 
 use crate::compression::{
     decompress_block, decompress_lz4_block, decompress_lz4_chunk, decompress_zstd,
+    decompress_zstd_prefix,
 };
 use crate::error::{Error, Result};
 use crate::header::{HEADER_LEN_LEGACY, u32_at};
@@ -64,9 +68,18 @@ pub fn decode(block: &[u8]) -> Result<Decoded> {
     let header = Header::parse(block)?;
     let mut payload = &block[header.payload_offset..];
     let mut blob_area: &[u8] = &[];
+    let mut zstd_main = None;
     if header.blob_count > 0 {
         let main_len = match header.compression {
+            // Nothing sizes the buffer, so decoding it is what finds where it ends.
+            Compression::Zstd if header.version.is_single_buffer() => {
+                let (out, used) =
+                    decompress_zstd_prefix(payload, header.uncompressed_size as usize)?;
+                zstd_main = Some(out);
+                used
+            }
             Compression::None => header.uncompressed_size as usize,
+            _ if header.version.is_single_buffer() => header.compressed_size as usize,
             _ => (header.buffer1_compressed_size as usize)
                 .saturating_add(header.buffer2_compressed_size as usize),
         };
@@ -81,7 +94,10 @@ pub fn decode(block: &[u8]) -> Result<Decoded> {
 
     let out = match header.compression {
         Compression::None => payload.to_vec(),
-        Compression::Zstd => decompress_zstd(payload, header.uncompressed_size as usize)?,
+        Compression::Zstd => match zstd_main {
+            Some(out) => out,
+            None => decompress_zstd(payload, header.uncompressed_size as usize)?,
+        },
         Compression::Lz4 => decompress_lz4(payload, &header)?,
         Compression::Block => {
             let stored = u32_at(block, HEADER_LEN_LEGACY) & 0x8000_0000 != 0;
@@ -139,17 +155,14 @@ fn read_blobs(header: &Header, payload: &[u8], area: &[u8]) -> Result<Vec<Vec<u8
     let buffer2 = payload
         .get(header.buffer1_uncompressed_size as usize..)
         .ok_or_else(short)?;
-    let chunk_len = if header.frame_size == 0 {
-        usize::from(u16::MAX) + 1
-    } else {
-        usize::from(header.frame_size)
-    };
+    let chunk_len = chunk_len(header);
 
     // The chunk table's length depends on the sizes before the trailer, and the trailer is
-    // found by counting back over the table, so try each plausible length.
+    // found by counting back over the table, so try each plausible length. An empty blob has
+    // no chunks, so the table can be shorter than the blob count, even empty.
     let (sizes, trailer_at) = if header.compression == Compression::Lz4 {
         let most = n.saturating_add(total / chunk_len);
-        (n..=most)
+        (0..=most)
             .find_map(|k| {
                 let trailer_at = buffer2
                     .len()
@@ -201,6 +214,25 @@ fn read_blobs(header: &Header, payload: &[u8], area: &[u8]) -> Result<Vec<Vec<u8
         blobs.push(take_blob_bytes(&mut rest, size)?.to_vec());
     }
     Ok(blobs)
+}
+
+/// The length LZ4 blobs are cut into before compression.
+fn chunk_len(header: &Header) -> usize {
+    if header.frame_size == 0 {
+        usize::from(u16::MAX) + 1
+    } else {
+        usize::from(header.frame_size)
+    }
+}
+
+/// How many bytes of per-chunk compressed lengths close the last buffer: a u16 per LZ4 chunk,
+/// and nothing for other compressions.
+pub(crate) fn chunk_table_len(header: &Header, blobs: &[Vec<u8>]) -> usize {
+    if header.compression != Compression::Lz4 {
+        return 0;
+    }
+    let len = chunk_len(header);
+    blobs.iter().map(|b| b.len().div_ceil(len)).sum::<usize>() * 2
 }
 
 /// The blob lengths that end at `trailer_at`, if the trailer is there and they add up to

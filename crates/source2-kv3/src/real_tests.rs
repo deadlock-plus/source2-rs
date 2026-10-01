@@ -1,7 +1,8 @@
 //! Rewrites every binary KV3 document found in a directory of sample files and compares the
 //! payloads.
 //!
-//! Skipped unless `SOURCE2_KV3_SAMPLES` or `SOURCE2_KV3_CORPUS` is set. Point
+//! Skipped unless `SOURCE2_KV3_SAMPLES` or `SOURCE2_KV3_CORPUS` is set. Once set, a document that
+//! fails to decode or parse fails the test. Point
 //! `SOURCE2_KV3_SAMPLES` at a directory: every `*_dir.vpk` under it is walked for compiled
 //! resources whose `DATA` block is binary KV3, and every other file that starts with a KV3
 //! magic is taken as a block itself.
@@ -285,12 +286,15 @@ fn real_documents_rewrite_to_identical_payloads() {
     let fast = std::env::var("SOURCE2_KV3_FAST").is_ok();
 
     let mut tallies: BTreeMap<(Version, String), Tally> = BTreeMap::new();
-    let mut skipped = 0;
+    let mut failed = Vec::new();
     let mut shown = 0;
     for s in &samples {
-        let (Ok(original), Ok(doc)) = (decode(&s.block), parse(&s.block)) else {
-            skipped += 1;
-            continue;
+        let (original, doc) = match (decode(&s.block), parse(&s.block)) {
+            (Ok(original), Ok(doc)) => (original, doc),
+            (Err(e), _) | (_, Err(e)) => {
+                failed.push(format!("{}: {e}", s.name));
+                continue;
+            }
         };
         let mut doc = doc;
         let key = (
@@ -368,7 +372,14 @@ fn real_documents_rewrite_to_identical_payloads() {
         }
     }
 
-    println!("documents {}, skipped {skipped}", samples.len());
+    println!(
+        "documents {}, failed to read {}",
+        samples.len(),
+        failed.len()
+    );
+    for f in failed.iter().take(15) {
+        println!("{f}");
+    }
     let mut bad = 0;
     for ((version, compression), t) in &tallies {
         println!(
@@ -388,4 +399,9 @@ fn real_documents_rewrite_to_identical_payloads() {
         bad += t.payload_mismatch + t.blob_mismatch + t.tree_mismatch + t.text_mismatch;
     }
     assert_eq!(bad, 0);
+    assert!(
+        failed.is_empty(),
+        "{} documents failed to read",
+        failed.len()
+    );
 }

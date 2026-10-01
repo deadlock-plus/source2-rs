@@ -142,7 +142,7 @@ match Document::from_text("{ a = ") {
 | `Version::V1` | `KV3\x01` | yes | yes | sample files (LZ4) |
 | `Version::V2` | `KV3\x02` | yes | yes | nothing: no sample exists, layout inferred |
 | `Version::V3` | `KV3\x03` | yes | yes | nothing: no sample exists, laid out as v4 |
-| `Version::V4` | `KV3\x04` | yes | yes | files from a shipped Source 2 title (LZ4, zstd) |
+| `Version::V4` | `KV3\x04` | yes | yes | files from a shipped Source 2 title (LZ4, zstd, blobs) |
 | `Version::V5` | `KV3\x05` | yes | yes | files from a shipped Source 2 title (LZ4, zstd, blobs) |
 
 `Compression::Block` is Valve's own byte-oriented scheme and exists only for `Legacy`. Pairings

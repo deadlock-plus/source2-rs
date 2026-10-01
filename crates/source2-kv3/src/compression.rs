@@ -69,6 +69,44 @@ pub(crate) fn decompress_zstd(payload: &[u8], expected: usize) -> Result<Vec<u8>
     Ok(out)
 }
 
+/// Decode whole zstd frames from the front of `payload` until they add up to `expected` bytes,
+/// and report how many input bytes they took. Whatever follows is not touched.
+///
+/// For payloads that have more data after the frames they own, where nothing but the frames
+/// themselves says where they end.
+#[cfg(feature = "zstd")]
+pub(crate) fn decompress_zstd_prefix(payload: &[u8], expected: usize) -> Result<(Vec<u8>, usize)> {
+    use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
+
+    let fail = |e: &dyn std::fmt::Display| Error::Compression(format!("zstd decode: {e}"));
+    let mut input = payload;
+    let mut out = Vec::with_capacity(expected);
+    let mut decoder = FrameDecoder::new();
+    while out.len() < expected {
+        decoder.init(&mut input).map_err(|e| fail(&e))?;
+        loop {
+            decoder
+                .decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1 << 20))
+                .map_err(|e| fail(&e))?;
+            if let Some(chunk) = decoder.collect() {
+                out.extend_from_slice(&chunk);
+            }
+            if decoder.is_finished() {
+                break;
+            }
+        }
+    }
+    Ok((out, payload.len() - input.len()))
+}
+
+#[cfg(not(feature = "zstd"))]
+pub(crate) fn decompress_zstd_prefix(
+    _payload: &[u8],
+    _expected: usize,
+) -> Result<(Vec<u8>, usize)> {
+    Err(no_codec("zstd", "zstd"))
+}
+
 #[cfg(not(feature = "zstd"))]
 pub(crate) fn decompress_zstd(_payload: &[u8], _expected: usize) -> Result<Vec<u8>> {
     Err(no_codec("zstd", "zstd"))

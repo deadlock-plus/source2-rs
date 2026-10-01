@@ -114,12 +114,13 @@ impl<'a> Parser<'a> {
             .find("-->")
             .ok_or_else(|| self.err("header comment is not closed"))?;
         let body = &self.src[body_start..self.pos + end];
-        let mut words = body.split_whitespace();
-        if words.next() != Some("kv3") {
-            return Err(self.err("header comment is not a kv3 header"));
-        }
+        let fields = body
+            .trim_start()
+            .strip_prefix("kv3")
+            .filter(|f| f.is_empty() || f.starts_with(|c: char| c.is_ascii_whitespace()))
+            .ok_or_else(|| self.err("header comment is not a kv3 header"))?;
         let (mut encoding, mut format) = (None, None);
-        for word in words {
+        for word in header_fields(fields) {
             let mut parts = word.splitn(3, ':');
             let (key, name, version) = (parts.next(), parts.next(), parts.next());
             let guid = version
@@ -476,4 +477,19 @@ fn integer(magnitude: u64, negative: bool) -> Option<Value> {
             Err(_) => Value::uint(magnitude),
         })
     }
+}
+
+/// Splits header fields at the `}` that closes each `version{guid}`, so fields need no space
+/// between them.
+fn header_fields(mut rest: &str) -> impl Iterator<Item = &str> {
+    std::iter::from_fn(move || {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return None;
+        }
+        let end = rest.find('}').map_or(rest.len(), |i| i + 1);
+        let (field, tail) = rest.split_at(end);
+        rest = tail;
+        Some(field)
+    })
 }

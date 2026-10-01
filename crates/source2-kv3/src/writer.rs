@@ -188,8 +188,7 @@ impl WriteOptions {
 ///
 /// # Errors
 ///
-/// [`Error::Invalid`] if the tree holds a blob and the revision has no blob area (v3 and v4), a
-/// string containing NUL, which the string pool cannot represent, nesting deeper than the
+/// [`Error::Invalid`] if the tree holds a string containing NUL, which the string pool cannot represent, nesting deeper than the
 /// reader allows, or more data than the header's 32-bit sizes can describe;
 /// [`Error::Unsupported`] for an unknown compression method or one the revision does not pair
 /// with; [`Error::Compression`] if the codec is not enabled.
@@ -228,7 +227,7 @@ fn write_pooled(root: &Value, options: &WriteOptions, version: Version) -> Resul
 
     let payload = match version {
         Version::V5 => enc.finish_v5(&mut header, options)?,
-        Version::V3 | Version::V4 => enc.finish_v4(&mut header, options.compression)?,
+        Version::V3 | Version::V4 => enc.finish_v4(&mut header, options)?,
         _ => enc.finish_flat(&mut header, options.compression)?,
     };
 
@@ -333,9 +332,9 @@ impl Layout {
         }
     }
 
-    /// Whether the revision can hold a blob at all.
-    pub fn blobs(self) -> bool {
-        !self.version.is_single_buffer()
+    /// Whether blobs live in an area after the buffers, rather than inline in the pools.
+    pub fn blob_area(self) -> bool {
+        matches!(self.version, Version::V3 | Version::V4 | Version::V5)
     }
 }
 
@@ -652,13 +651,7 @@ impl Encoder {
                 self.pool().ints.push(id);
             }
             (Kind::Blob(bytes), _) => {
-                if !self.layout.blobs() {
-                    return Err(Error::Invalid(
-                        "KV3 v3 and v4 have no blob area, so a blob value needs another revision"
-                            .into(),
-                    ));
-                }
-                if self.version == Version::V5 {
+                if self.layout.blob_area() {
                     self.blobs.push(bytes.clone());
                 } else {
                     let len = size(bytes.len(), "blob")?;
@@ -877,7 +870,8 @@ impl Encoder {
     }
 
     /// Lay out the single v3 or v4 buffer, compress it, and fill in the header.
-    fn finish_v4(mut self, header: &mut [u8], compression: Compression) -> Result<Vec<u8>> {
+    fn finish_v4(mut self, header: &mut [u8], options: &WriteOptions) -> Result<Vec<u8>> {
+        let compression = options.compression;
         let string_count = size(self.string_ids.len(), "string count")?;
         let pool = &mut self.pools[0];
         pool.ints.insert(0, string_count);
@@ -889,8 +883,18 @@ impl Encoder {
         let region = self.string_blob.len() + self.types.len();
         payload.extend_from_slice(&self.string_blob);
         payload.extend_from_slice(&self.types);
+        for b in &self.blobs {
+            payload.extend_from_slice(&size(b.len(), "blob")?.to_le_bytes());
+        }
         payload.extend_from_slice(&crate::decode::TRAILER_BYTES);
+        let (area, chunk_sizes) = blob_area(&self.blobs, compression, options.lz4_chunk())?;
+        for c in &chunk_sizes {
+            payload.extend_from_slice(&c.to_le_bytes());
+        }
 
+        let blob_total: usize = self.blobs.iter().map(Vec::len).sum();
+        put_size(header, field::BLOB_COUNT, self.blobs.len(), "blob count")?;
+        put_size(header, field::BLOB_TOTAL_SIZE, blob_total, "blob total")?;
         put_size(header, field::BINARY_BYTES, pool.bytes.len(), "1-byte pool")?;
         put_size(header, field::INTEGERS, pool.ints.len(), "4-byte pool")?;
         put_size(header, field::EIGHT_BYTES, pool.eights.len(), "8-byte pool")?;
@@ -900,13 +904,24 @@ impl Encoder {
 
         let compressed = compress(&payload, compression)?;
         put_size(header, field::UNCOMPRESSED_SIZE, payload.len(), "payload")?;
+        // Only zstd counts the blob frames here; LZ4 and stored files stop at the buffer.
+        let counted_area = if compression == Compression::Zstd {
+            area.len()
+        } else {
+            0
+        };
         put_size(
             header,
             field::COMPRESSED_SIZE,
-            compressed.len(),
+            compressed.len() + counted_area,
             "compressed payload",
         )?;
-        Ok(compressed)
+        let mut block = compressed;
+        if !self.blobs.is_empty() {
+            block.extend_from_slice(&area);
+            block.extend_from_slice(&crate::decode::TRAILER_BYTES);
+        }
+        Ok(block)
     }
 
     /// Lay out the v1 or v2 payload: bytes, 4-byte integers led by the string count, 8-byte

@@ -154,7 +154,7 @@ pub struct Header {
     pub eight_byte_count_buffer2: u32,
     /// Number of objects in buffer 2, and so the length of its object-length table.
     pub object_count_buffer2: u32,
-    /// Number of binary blobs stored after the two buffers (v5 only).
+    /// Number of binary blobs stored after the buffers (v3 to v5).
     pub blob_count: u32,
     /// Total length of the blobs once decompressed.
     pub blob_total_size: u32,
@@ -314,7 +314,8 @@ impl Header {
         format.copy_from_slice(&block[field::FORMAT..field::FORMAT + 16]);
 
         let compressed_size = u32_at(field::COMPRESSED_SIZE);
-        let blob_count = v5_only(field::BLOB_COUNT);
+        // Both sit below offset 72, so v3 and v4 headers state them as v5 does.
+        let blob_count = u32_at(field::BLOB_COUNT);
         // Derived rather than assumed. With blobs the block runs on past the buffers, and LZ4
         // files do not count that tail in `compressed_size` while zstd ones do, so the
         // subtraction means nothing and the payload sits right after the header.
@@ -351,7 +352,7 @@ impl Header {
             eight_byte_count_buffer2: v5_only(field::B2_EIGHT_BYTES),
             object_count_buffer2: v5_only(field::B2_OBJECTS),
             blob_count,
-            blob_total_size: v5_only(field::BLOB_TOTAL_SIZE),
+            blob_total_size: u32_at(field::BLOB_TOTAL_SIZE),
             compressed_size,
             uncompressed_size: u32_at(field::UNCOMPRESSED_SIZE),
             buffer1_uncompressed_size: v5_only(field::BUFFER1_UNCOMPRESSED),

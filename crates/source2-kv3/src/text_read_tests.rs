@@ -359,3 +359,11 @@ fn errors_name_the_line() {
     let e = parse_text("{\n a = 1\n b = ?\n}").unwrap_err().to_string();
     assert!(e.contains("line 3"), "{e}");
 }
+
+#[test]
+fn header_fields_need_no_separating_space() {
+    let compact = "<!-- kv3 encoding:text:version{e21c7f3c-8a33-41c5-9977-a76d3a32aa0d}format:generic:version{7412167c-06e9-4698-aff2-e63eb59037e7} -->\n{ a = 1 }";
+    let doc = parse_text(compact).expect("compact header parses");
+    assert_eq!(doc.root, obj(&[("a", Value::int(1))]));
+    assert!(doc.to_text().expect("write").starts_with(HEADER));
+}

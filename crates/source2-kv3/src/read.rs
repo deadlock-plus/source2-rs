@@ -71,7 +71,7 @@ pub(crate) fn parse_root(decoded: &Decoded) -> Result<Value> {
     match header.version {
         Version::Legacy => crate::legacy::parse_legacy(&decoded.payload),
         Version::V1 | Version::V2 => parse_flat(&decoded.payload, header),
-        Version::V3 | Version::V4 => parse_v4(&decoded.payload, header),
+        Version::V3 | Version::V4 => parse_v4(&decoded.payload, header, &decoded.blobs),
         Version::V5 => parse_v5(&decoded.payload, header, &decoded.blobs),
     }
 }
@@ -300,10 +300,23 @@ fn parse_v5(payload: &[u8], h: &Header, blobs: &[Vec<u8>]) -> Result<Value> {
 /// measuring back from the end of the payload pins both exactly. Valve's files align the string
 /// blob to 8 bytes even when the 8-byte pool is empty; measuring backwards accepts that and
 /// files that do not.
-fn parse_v4(payload: &[u8], h: &Header) -> Result<Value> {
+///
+/// Blobs sit after the buffer, but their lengths, a trailer and on LZ4 the chunk lengths close
+/// the buffer itself, between the type stream and the end. Setting those aside leaves the
+/// region and its trailer last, as in a document without blobs.
+fn parse_v4(payload: &[u8], h: &Header, blobs: &[Vec<u8>]) -> Result<Value> {
+    let chunk_table = crate::decode::chunk_table_len(h, blobs);
+    let sizes_len = blobs.len() * 4;
+    let payload_end = payload.len().checked_sub(chunk_table).ok_or_else(|| {
+        Error::Malformed(format!(
+            "KV3 v4 blob chunk table of {chunk_table} bytes does not fit a payload of {} bytes",
+            payload.len()
+        ))
+    })?;
+    let payload = &payload[..payload_end];
     let blob_len = h.type_count as usize;
     let blob_start = blob_len
-        .checked_add(4)
+        .checked_add(4 + sizes_len)
         .and_then(|tail| payload.len().checked_sub(tail))
         .ok_or_else(|| {
             Error::Malformed(format!(
@@ -351,10 +364,10 @@ fn parse_v4(payload: &[u8], h: &Header) -> Result<Value> {
     // type stream. Its length is never stated on its own.
     let blob = &payload[blob_start..blob_start + blob_len];
     let (strings, types) = read_strings(blob, string_count)?;
-    check_trailer(&payload[blob_start + blob_len..])?;
+    check_trailer(&payload[blob_start + blob_len + sizes_len..])?;
 
     let mut reader = Reader {
-        blobs: &[],
+        blobs,
         next_blob: 0,
         inline_blobs: false,
         strings,
