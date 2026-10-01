@@ -49,11 +49,15 @@
 //! decompressing garbage.
 
 pub mod error;
+#[cfg(feature = "lz4")]
+mod lz4_hc;
 
 use crate::error::{Error, Result};
 
 #[cfg(all(test, feature = "lz4", feature = "zstd"))]
 mod blob_tests;
+#[cfg(all(test, feature = "lz4"))]
+mod lz4_hc_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

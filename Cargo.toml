@@ -20,8 +20,11 @@ source2-vpk = { version = "0.1.0", path = "crates/source2-vpk" }
 # Pure Rust so `forbid(unsafe_code)` holds and no C toolchain is needed to cross-compile.
 # KV3 stores LZ4 blocks, not frames, so `frame` is dropped along with its transitive
 # `twox-hash`. `safe-decode` and `checked-decode` keep it free of `unsafe`.
-lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode", "checked-decode", "safe-encode", "std"] }
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode", "checked-decode", "std"] }
 ruzstd = { version = "0.9", default-features = false, features = ["std"] }
+# Encoder only; `ruzstd` decodes. Valve's files are level 7 with a content checksum, which
+# `ruzstd` cannot write (Fastest only). Pure Rust and `forbid(unsafe_code)`.
+zstd-rs = { version = "0.1", default-features = false }
 
 [workspace.lints.rust]
 missing_docs = "warn"

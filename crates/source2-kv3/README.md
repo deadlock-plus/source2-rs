@@ -10,10 +10,10 @@ Reader for Valve's binary KeyValues 3 (KV3), the payload format inside `vdata_c`
 
 | Feature | Default | Effect |
 |---|---|---|
-| `lz4` | yes | LZ4 decompression via `lz4_flex` |
-| `zstd` | yes | zstd decompression via `ruzstd` |
+| `lz4` | yes | LZ4 read via `lz4_flex`, and write (high-compression, built in) |
+| `zstd` | yes | zstd read via `ruzstd`, and write via `zstd-rs` |
 
-Disable defaults to drop a decompressor you do not need:
+Disable defaults to drop a codec you do not need:
 
 ```toml
 source2-kv3 = { version = "*", default-features = false, features = ["lz4"] }

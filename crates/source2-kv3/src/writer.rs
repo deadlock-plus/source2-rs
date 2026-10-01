@@ -21,8 +21,10 @@
 //!
 //! # Compression
 //!
-//! zstd is written with `ruzstd`'s fastest level, one frame per buffer on v5. LZ4 is
-//! written with `lz4_flex`, one block per buffer.
+//! Both follow what Valve's files use, so the output is about the same size as theirs. LZ4
+//! is high-compression: level 9 for the buffers and level 12 for the blob chunks, one
+//! block per buffer or chunk. zstd is level 7 with the content checksum and size, one frame
+//! per buffer on v5.
 
 use std::collections::HashMap;
 
@@ -53,6 +55,10 @@ pub struct WriteOptions {
 /// Frame size Deadlock's LZ4 files declare. Advisory on read, so it is only written for
 /// fidelity.
 const LZ4_FRAME_SIZE: u16 = 16384;
+
+/// The zstd level Valve's files were written at, judged by their sizes.
+#[cfg(feature = "zstd")]
+const ZSTD_LEVEL: i32 = 7;
 
 /// Marks the end of a KV3 document.
 const TRAILER: u32 = 0xFFEE_DD00;
@@ -511,7 +517,7 @@ fn blob_area(blobs: &[Vec<u8>], compression: Compression) -> Result<(Vec<u8>, Ve
     Ok((area, chunk_sizes))
 }
 
-fn compress(raw: &[u8], compression: Compression) -> Result<Vec<u8>> {
+pub(crate) fn compress(raw: &[u8], compression: Compression) -> Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(raw.to_vec()),
         Compression::Lz4 => compress_lz4(raw),
@@ -524,7 +530,7 @@ fn compress(raw: &[u8], compression: Compression) -> Result<Vec<u8>> {
 
 #[cfg(feature = "lz4")]
 fn compress_lz4(raw: &[u8]) -> Result<Vec<u8>> {
-    Ok(lz4_flex::block::compress(raw))
+    Ok(crate::lz4_hc::compress(&[], raw, crate::lz4_hc::Level::L9))
 }
 
 /// One blob chunk, free to match against the last 64 KiB of the chunks before it, which
@@ -532,7 +538,11 @@ fn compress_lz4(raw: &[u8]) -> Result<Vec<u8>> {
 #[cfg(feature = "lz4")]
 fn compress_lz4_chunk(chunk: &[u8], stream: &[u8]) -> Result<Vec<u8>> {
     let window = &stream[stream.len().saturating_sub(crate::LZ4_WINDOW)..];
-    Ok(lz4_flex::block::compress_with_dict(chunk, window))
+    Ok(crate::lz4_hc::compress(
+        window,
+        chunk,
+        crate::lz4_hc::Level::L12,
+    ))
 }
 
 #[cfg(not(feature = "lz4"))]
@@ -549,10 +559,17 @@ fn compress_lz4(_raw: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(feature = "zstd")]
 fn compress_zstd(raw: &[u8]) -> Result<Vec<u8>> {
-    Ok(ruzstd::encoding::compress_to_vec(
-        raw,
-        ruzstd::encoding::CompressionLevel::Fastest,
-    ))
+    let config = zstd_rs::CompressionConfig {
+        level: ZSTD_LEVEL,
+        checksum: true,
+        content_size: true,
+        ..zstd_rs::CompressionConfig::DEFAULT
+    };
+    let mut frame = Vec::new();
+    zstd_rs::Compressor::new(config)
+        .and_then(|mut c| c.compress(raw, None, &mut frame))
+        .map_err(|e| Error::Malformed(format!("zstd encode: {e}")))?;
+    Ok(frame)
 }
 
 #[cfg(not(feature = "zstd"))]

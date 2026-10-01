@@ -14,11 +14,15 @@ readme = "README.md"
 [dependencies]
 lz4_flex = { workspace = true, optional = true }
 ruzstd = { workspace = true, optional = true }
+zstd-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+lz4_flex = { workspace = true, features = ["safe-encode"] }
 
 [features]
 default = ["lz4", "zstd"]
 lz4 = ["dep:lz4_flex"]
-zstd = ["dep:ruzstd"]
+zstd = ["dep:ruzstd", "dep:zstd-rs"]
 
 [lints]
 workspace = true

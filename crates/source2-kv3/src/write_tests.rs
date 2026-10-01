@@ -421,6 +421,7 @@ fn the_shape_counts_match_what_shipped_files_state() {
 }
 
 /// Bytes with no short-range repetition, so only a long-range match can shrink them.
+#[cfg(feature = "lz4")]
 fn noise(len: usize) -> Vec<u8> {
     let mut x = 0x2545_F491_4F6C_DD1Du64;
     (0..len)
@@ -485,4 +486,91 @@ fn lz4_blob_chunks_match_against_earlier_output() {
         plain.len()
     );
     round_trip(&value, Version::V5, Compression::Lz4);
+}
+
+/// Text from a small vocabulary: many near-equal matches, so a better parser has room to win.
+#[cfg(any(feature = "lz4", feature = "zstd"))]
+fn soup(len: usize) -> Vec<u8> {
+    const VOCAB: [&str; 10] = [
+        "ability_",
+        "hero_inferno",
+        "upgrade",
+        "citadel_",
+        "mod_category",
+        "spirit",
+        "weapon",
+        "vitality",
+        "_tier3",
+        "damage",
+    ];
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut out = Vec::new();
+    while out.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(VOCAB[(x >> 40) as usize % VOCAB.len()].as_bytes());
+        if (x >> 20) % 5 == 1 {
+            out.push((x >> 8) as u8);
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+#[cfg(feature = "lz4")]
+#[test]
+fn lz4_blobs_are_smaller_than_the_fast_encoder_makes_them() {
+    let blob = soup(300_000);
+    let mut stream: Vec<u8> = Vec::new();
+    let mut fast = 0;
+    for chunk in blob.chunks(16384) {
+        let window = &stream[stream.len().saturating_sub(65536)..];
+        fast += lz4_flex::block::compress_with_dict(chunk, window).len();
+        stream.extend_from_slice(chunk);
+    }
+    let value = object(vec![("blob", Value::Blob(blob))]);
+    let packed = write(&value, &options(Version::V5, Compression::Lz4)).expect("write");
+    assert!(
+        packed.len() < fast,
+        "{} B written vs {fast} B of fast blocks",
+        packed.len()
+    );
+    round_trip(&value, Version::V5, Compression::Lz4);
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_frames_carry_a_content_checksum_and_size() {
+    let frame = crate::writer::compress(&soup(10_000), Compression::Zstd).expect("compress");
+    assert_eq!(frame[..4], [0x28, 0xB5, 0x2F, 0xFD]);
+    let descriptor = frame[4];
+    assert_ne!(
+        descriptor & 0x04,
+        0,
+        "checksum flag, descriptor {descriptor:#04x}"
+    );
+    assert!(
+        descriptor >> 6 != 0 || descriptor & 0x20 != 0,
+        "content size is stated, descriptor {descriptor:#04x}"
+    );
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_output_is_smaller_than_the_fastest_level() {
+    let blob = soup(300_000);
+    let fastest = ruzstd::encoding::compress_to_vec(
+        blob.as_slice(),
+        ruzstd::encoding::CompressionLevel::Fastest,
+    );
+    let value = object(vec![("blob", Value::Blob(blob))]);
+    let packed = write(&value, &options(Version::V5, Compression::Zstd)).expect("write");
+    assert!(
+        packed.len() < fastest.len(),
+        "{} B written vs {} B at Fastest",
+        packed.len(),
+        fastest.len()
+    );
+    round_trip(&value, Version::V5, Compression::Zstd);
 }
