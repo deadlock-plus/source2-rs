@@ -1,6 +1,6 @@
 [package]
 name = "source2-vpk"
-description = "Reader for Valve Pak (VPK) archives"
+description = "Reader and writer for Valve Pak (VPK) archives, versions 1 and 2, with MD5 and signature sections"
 keywords = ["source2", "vpk", "valve", "archive"]
 categories = ["game-development", "parser-implementations"]
 version.workspace = true
