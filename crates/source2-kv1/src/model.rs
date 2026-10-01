@@ -5,7 +5,26 @@ use crate::{Encoding, Result, binary, text_read, text_write};
 pub const DEFAULT_MAX_DEPTH: usize = 128;
 
 /// Knobs for reading and writing.
+///
+/// Non-exhaustive: build with [`Options::new`] and the `with_*` methods, or assign to the
+/// fields of a default value.
+///
+/// ```
+/// use source2_kv1::Options;
+///
+/// let options = Options::new().with_escape_sequences(false).with_max_depth(16);
+/// assert_eq!(options.max_depth, 16);
+/// ```
+///
+/// A struct literal does not compile outside this crate:
+///
+/// ```compile_fail
+/// use source2_kv1::Options;
+///
+/// let _ = Options { escape_sequences: true, max_depth: 1 };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Options {
     /// Reading text: decode backslash escapes in quoted strings. The choice is stored in
     /// [`Document::escapes`] and the writer follows that, so a file read with escapes off is
@@ -14,6 +33,28 @@ pub struct Options {
     /// Deepest section nesting accepted when reading and allowed when writing. The first
     /// level of sections is depth 1.
     pub max_depth: usize,
+}
+
+impl Options {
+    /// Default options, same as [`Options::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets [`Options::escape_sequences`].
+    #[must_use]
+    pub fn with_escape_sequences(mut self, escape_sequences: bool) -> Self {
+        self.escape_sequences = escape_sequences;
+        self
+    }
+
+    /// Sets [`Options::max_depth`].
+    #[must_use]
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
+    }
 }
 
 impl Default for Options {
@@ -31,6 +72,7 @@ impl Default for Options {
 /// [`Document::from_binary`]. Writing a document that was read gives back the input; a
 /// hand-built one is written in Valve's conventional layout.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Document {
     /// `#include` / `#base` lines, in file order.
     pub directives: Vec<Directive>,
@@ -81,6 +123,7 @@ impl DirectiveKind {
 /// Directives are only recognised at the top level of a document. Inside a section the same
 /// word is an ordinary key.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Directive {
     /// Which directive it is.
     pub kind: DirectiveKind,
@@ -132,10 +175,18 @@ impl Directive {
         self.condition = Some(condition.into());
         self
     }
+
+    /// Replaces the layout.
+    #[must_use]
+    pub fn with_layout(mut self, layout: Layout) -> Self {
+        self.layout = layout;
+        self
+    }
 }
 
 /// One key with its value and optional conditional tag.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Entry {
     /// The key.
     pub key: String,
@@ -263,6 +314,27 @@ impl Document {
             roots,
             ..Self::default()
         }
+    }
+
+    /// Sets [`Document::escapes`].
+    #[must_use]
+    pub fn with_escapes(mut self, escapes: bool) -> Self {
+        self.escapes = escapes;
+        self
+    }
+
+    /// Sets [`Document::encoding`].
+    #[must_use]
+    pub fn with_encoding(mut self, encoding: Encoding) -> Self {
+        self.encoding = encoding;
+        self
+    }
+
+    /// Sets the document-wide layout.
+    #[must_use]
+    pub fn with_layout(mut self, layout: DocumentLayout) -> Self {
+        self.layout = layout;
+        self
     }
 
     /// Adds a directive.
@@ -460,6 +532,13 @@ impl Entry {
     #[must_use]
     pub fn with_condition(mut self, condition: impl Into<String>) -> Self {
         self.condition = Some(condition.into());
+        self
+    }
+
+    /// Replaces the layout.
+    #[must_use]
+    pub fn with_layout(mut self, layout: Layout) -> Self {
+        self.layout = layout;
         self
     }
 

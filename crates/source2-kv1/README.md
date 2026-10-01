@@ -131,11 +131,28 @@ match Document::parse("\"Root\"\n{\n\t\"a\" \"unterminated\n") {
 ```rust
 use source2_kv1::{Document, Options};
 
-let mut options = Options::default();
-options.escape_sequences = false; // backslash is an ordinary character
-options.max_depth = 16;
+let options = Options::new()
+    .with_escape_sequences(false) // backslash is an ordinary character
+    .with_max_depth(16);
 let doc = Document::parse_with(r#""Path" { "dir" "C:\temp" }"#, &options)?;
 assert_eq!(doc.get("Path").unwrap().get_str("dir"), Some(r"C:\temp"));
+# Ok::<(), source2_kv1::Error>(())
+```
+
+`Options`, `Document`, `Entry`, `Directive`, `Layout`, `DocumentLayout` and `Spelling` are
+`#[non_exhaustive]`: build them with `new` / `default` and the `with_*` methods, or assign to
+their public fields after construction. Struct literals do not compile outside the crate, so
+new fields are not a breaking change.
+
+```rust
+use source2_kv1::{Document, DocumentLayout, Entry, Layout, Options, Quote, Spelling};
+
+let doc = Document::new(vec![
+    Entry::string("a", "b").with_layout(Layout::new().with_key(Spelling::new().with_quote(Quote::Bare))),
+])
+.with_layout(DocumentLayout::new().with_bom(true));
+let text = doc.to_text_with(&Options::new().with_max_depth(8))?;
+assert!(text.starts_with("\u{feff}a"));
 # Ok::<(), source2_kv1::Error>(())
 ```
 
@@ -162,6 +179,10 @@ assert_eq!(doc.get("Path").unwrap().get_str("dir"), Some(r"C:\temp"));
   (`Error::UnsupportedType`).
 - Wide strings use a 16-bit count and 16-bit units. Lone surrogates are an error.
 - Binary data after the final end marker is an error, not preserved.
+- Text may end with one NUL byte, as Valve's `.res` files do. It is kept in
+  `DocumentLayout::trailing_nul`. A NUL anywhere else is an error.
+- A bare `=` between a key and value (`style="x"` in some `.res` and `.menu` files) is not KV1.
+  It reads as part of the token and is not given special treatment.
 - Nothing is evaluated: no condition evaluation, no include merging, no type guessing. An
   entry whose condition is false for you is still in the tree; filter it yourself.
 
@@ -169,16 +190,17 @@ assert_eq!(doc.get("Path").unwrap().get_str("dir"), Some(r"C:\temp"));
 
 Real files, read-only, via tests in `src/real_tests.rs`. Set
 `SOURCE2_KV1_SAMPLES` to a directory of sample files (searched recursively). Files with a
-text extension (`vdf`, `vcfg`, `acf`, `txt`, `lst`, `gi`) must parse and write back
-byte-identical unless they are not KV1 text; files with extension `bin` are checked as
-binary. Without the variable the tests pass without checking anything.
+text extension (`vdf`, `vcfg`, `acf`, `txt`, `lst`, `gi`, `res`, `menu`, `cfg`) must parse
+and write back byte-identical; files that are not KV1 text, or use a bare `=` separator, are
+counted and skipped. Files with extension `bin` are checked as binary the same way. Without the variable the tests pass without checking anything.
 
 ```sh
 SOURCE2_KV1_SAMPLES=/path/to/samples cargo test -p source2-kv1 real_ -- --nocapture
 ```
 
-Checked this way: 94 text files (93 UTF-8, 1 Windows-1252; CRLF and LF, tabs, comments, blank
-lines) and one 13-byte binary file (an empty section), all byte-identical.
+Checked this way against a Steam install: 1407 text files parsed and byte-identical (847
+skipped as not KV1 text) and 191 binary files parsed and byte-identical (207 skipped as not
+KV1 binary). Valve `.res` files with a trailing NUL are among them.
 
 Not verified:
 

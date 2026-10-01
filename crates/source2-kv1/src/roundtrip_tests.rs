@@ -118,3 +118,25 @@ fn windows_1252_text_round_trips() {
     let doc = Document::parse_bytes(bytes).unwrap();
     assert_eq!(doc.to_text_bytes().unwrap(), bytes);
 }
+
+#[test]
+fn trailing_nul_survives() {
+    same("\"a\"\n{\n\tk v\n}\n\0");
+    same("a { k v }\0");
+    same("a { k v }\n// end\n\0");
+}
+
+#[test]
+fn trailing_nul_is_recorded() {
+    let d = Document::parse("a { k v }\n\0").unwrap();
+    assert!(d.layout.trailing_nul);
+    assert!(!Document::parse("a { k v }\n").unwrap().layout.trailing_nul);
+}
+
+#[test]
+fn embedded_nul_is_an_error() {
+    assert!(Document::parse("a { k v }\0\0").is_err());
+    assert!(Document::parse("a { k v }\0 b { k v }").is_err());
+    assert!(Document::parse("a { k \0 }").is_err());
+    assert!(Document::parse("\0a { k v }").is_err());
+}

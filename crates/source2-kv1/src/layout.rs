@@ -45,6 +45,7 @@ pub enum Quote {
 
 /// The source spelling of one string token.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Spelling {
     /// Quoted or bare.
     pub quote: Quote,
@@ -52,6 +53,28 @@ pub struct Spelling {
     /// for the decoded value (for example `\?` or an unknown escape). It is used only while
     /// it still decodes to the current value, so editing the value never writes stale text.
     pub raw: Option<String>,
+}
+
+impl Spelling {
+    /// The conventional spelling: quoted, no raw text.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets quoted or bare.
+    #[must_use]
+    pub fn with_quote(mut self, quote: Quote) -> Self {
+        self.quote = quote;
+        self
+    }
+
+    /// Sets the raw text between the quotes.
+    #[must_use]
+    pub fn with_raw(mut self, raw: impl Into<String>) -> Self {
+        self.raw = Some(raw.into());
+        self
+    }
 }
 
 /// Where a conditional tag sits relative to its entry.
@@ -91,6 +114,7 @@ impl LineEnding {
 ///
 /// `None` in a trivia field means "conventional"; `Some(vec![])` means "nothing here".
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Layout {
     /// Spelling of the key (the keyword for a directive).
     pub key: Spelling,
@@ -116,6 +140,75 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// The conventional layout, same as [`Layout::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the key spelling.
+    #[must_use]
+    pub fn with_key(mut self, key: Spelling) -> Self {
+        self.key = key;
+        self
+    }
+
+    /// Sets the value spelling.
+    #[must_use]
+    pub fn with_value(mut self, value: Spelling) -> Self {
+        self.value = value;
+        self
+    }
+
+    /// Sets the exact text inside the conditional tag's brackets.
+    #[must_use]
+    pub fn with_condition_raw(mut self, condition_raw: impl Into<String>) -> Self {
+        self.condition_raw = Some(condition_raw.into());
+        self
+    }
+
+    /// Sets the position of the conditional tag.
+    #[must_use]
+    pub fn with_condition_at(mut self, condition_at: ConditionAt) -> Self {
+        self.condition_at = Some(condition_at);
+        self
+    }
+
+    /// Sets the trivia before the key; an empty list means nothing.
+    #[must_use]
+    pub fn with_leading(mut self, leading: Vec<Trivia>) -> Self {
+        self.leading = Some(leading);
+        self
+    }
+
+    /// Sets the trivia after the key.
+    #[must_use]
+    pub fn with_key_gap(mut self, key_gap: Vec<Trivia>) -> Self {
+        self.key_gap = Some(key_gap);
+        self
+    }
+
+    /// Sets the trivia beside the conditional tag.
+    #[must_use]
+    pub fn with_condition_gap(mut self, condition_gap: Vec<Trivia>) -> Self {
+        self.condition_gap = Some(condition_gap);
+        self
+    }
+
+    /// Sets the trivia before a section's closing brace.
+    #[must_use]
+    pub fn with_before_close(mut self, before_close: Vec<Trivia>) -> Self {
+        self.before_close = Some(before_close);
+        self
+    }
+
+    /// Sets the same-line trivia after the entry.
+    #[must_use]
+    pub fn with_trailing(mut self, trailing: Vec<Trivia>) -> Self {
+        self.trailing = trailing;
+        self
+    }
+
     /// The text of every leading `//` comment, in order.
     pub fn comments(&self) -> impl Iterator<Item = &str> {
         self.leading.iter().flatten().filter_map(|t| match t {
@@ -143,6 +236,7 @@ impl Layout {
 
 /// Document-wide layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DocumentLayout {
     /// The text began with a UTF-8 byte order mark.
     pub bom: bool,
@@ -155,6 +249,9 @@ pub struct DocumentLayout {
     pub trailing: Option<Vec<Trivia>>,
     /// Binary only: the closing end marker byte was present. Some files end without it.
     pub end_marker: bool,
+    /// Text only: the input ended with a single NUL byte after the last token, as Valve's
+    /// tools write it.
+    pub trailing_nul: bool,
 }
 
 impl Default for DocumentLayout {
@@ -165,11 +262,60 @@ impl Default for DocumentLayout {
             leading: Vec::new(),
             trailing: None,
             end_marker: true,
+            trailing_nul: false,
         }
     }
 }
 
 impl DocumentLayout {
+    /// The conventional layout, same as [`DocumentLayout::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets whether the text begins with a UTF-8 byte order mark.
+    #[must_use]
+    pub fn with_bom(mut self, bom: bool) -> Self {
+        self.bom = bom;
+        self
+    }
+
+    /// Sets the line ending.
+    #[must_use]
+    pub fn with_line_ending(mut self, line_ending: LineEnding) -> Self {
+        self.line_ending = line_ending;
+        self
+    }
+
+    /// Sets the trivia before the first token.
+    #[must_use]
+    pub fn with_leading(mut self, leading: Vec<Trivia>) -> Self {
+        self.leading = leading;
+        self
+    }
+
+    /// Sets the trivia after the last token; an empty list means nothing.
+    #[must_use]
+    pub fn with_trailing(mut self, trailing: Vec<Trivia>) -> Self {
+        self.trailing = Some(trailing);
+        self
+    }
+
+    /// Sets whether binary output ends with the end marker byte.
+    #[must_use]
+    pub fn with_end_marker(mut self, end_marker: bool) -> Self {
+        self.end_marker = end_marker;
+        self
+    }
+
+    /// Sets whether text output ends with a NUL byte.
+    #[must_use]
+    pub fn with_trailing_nul(mut self, trailing_nul: bool) -> Self {
+        self.trailing_nul = trailing_nul;
+        self
+    }
+
     /// The text of every header comment, in order.
     pub fn comments(&self) -> impl Iterator<Item = &str> {
         self.leading.iter().filter_map(|t| match t {
