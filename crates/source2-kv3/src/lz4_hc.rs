@@ -1,11 +1,11 @@
 //! LZ4 high-compression block encoder.
 //!
-//! `lz4_flex` has no high-compression mode, and Valve's shipped KV3 files come from one: the
-//! buffers match the reference encoder's level 9 and the blob chunks its level 12. This is
-//! a port of that reference algorithm - hash chains with lazy matching for [`Level::Chain`],
-//! price-based parsing for [`Level::Optimal`] - so the output lands within a fraction of a
-//! percent of the shipped sizes. Long single-byte runs are not special-cased the way the
-//! reference does, so they are searched in full.
+//! `lz4_flex` has no high-compression mode, and Valve's KV3 files come from one: every LZ4
+//! buffer and blob chunk checked re-encodes to the same bytes at the reference encoder's level
+//! 12. This is a port of that reference algorithm - price-based parsing over hash chains for
+//! [`Level::Optimal`], which is level 12, and the cheaper lazy matching for [`Level::Chain`],
+//! level 9, which nothing in the crate uses outside its tests. Long single-byte runs are not
+//! special-cased the way the reference does, so they are searched in full.
 
 const MIN_MATCH: usize = 4;
 const MF_LIMIT: usize = 12;
@@ -22,6 +22,7 @@ const TRAILING_LITERALS: usize = 3;
 
 /// How hard to search. The two presets mirror the reference encoder's levels 9 and 12.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Level {
     /// Lazy matching over hash chains.
     Chain { attempts: usize },
@@ -34,6 +35,7 @@ pub(crate) enum Level {
 }
 
 impl Level {
+    #[cfg(test)]
     pub(crate) const L9: Level = Level::Chain { attempts: 1024 };
     pub(crate) const L12: Level = Level::Optimal {
         attempts: 16384,

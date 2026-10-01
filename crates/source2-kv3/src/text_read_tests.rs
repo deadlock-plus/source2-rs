@@ -1,4 +1,5 @@
-use crate::value::MAX_DEPTH;
+use crate::read::MAX_DEPTH;
+use crate::value::flag;
 use crate::{Object, Value, parse_text};
 
 const HEADER: &str = "<!-- kv3 encoding:text:version{e21c7f3c-8a33-41c5-9977-a76d3a32aa0d} format:generic:version{7412167c-06e9-4698-aff2-e63eb59037e7} -->";
@@ -6,17 +7,19 @@ const HEADER: &str = "<!-- kv3 encoding:text:version{e21c7f3c-8a33-41c5-9977-a76
 fn obj(members: &[(&str, Value)]) -> Value {
     let mut o = Object::default();
     for (k, v) in members {
-        o.insert((*k).to_string(), v.clone());
+        o.push((*k).to_string(), v.clone());
     }
-    Value::Object(o)
+    Value::from(o)
 }
 
 fn s(v: &str) -> Value {
-    Value::String(v.to_string())
+    Value::from(v.to_string())
 }
 
 fn ok(input: &str) -> Value {
-    parse_text(input).unwrap_or_else(|e| panic!("{input:?} should parse: {e}"))
+    parse_text(input)
+        .unwrap_or_else(|e| panic!("{input:?} should parse: {e}"))
+        .root
 }
 
 fn rejects(input: &str) {
@@ -30,12 +33,12 @@ fn empty_object_with_header() {
 
 #[test]
 fn header_is_optional() {
-    assert_eq!(ok("{ a = 1 }"), obj(&[("a", Value::Int(1))]));
+    assert_eq!(ok("{ a = 1 }"), obj(&[("a", Value::int(1))]));
 }
 
 #[test]
 fn header_accepts_any_guids() {
-    let h = "<!-- kv3 encoding:text:version{00000000-0000-0000-0000-000000000000} format:vdata:version{ffffffff-ffff-ffff-ffff-ffffffffffff} -->";
+    let h = "<!-- kv3 encoding:text:version{00000000-0000-0000-0000-000000000000} format:custom:version{ffffffff-ffff-ffff-ffff-ffffffffffff} -->";
     assert_eq!(ok(&format!("{h}\n{{}}")), obj(&[]));
 }
 
@@ -50,7 +53,7 @@ fn malformed_headers_are_rejected() {
 
 #[test]
 fn byte_order_mark_is_skipped() {
-    assert_eq!(ok("\u{feff}{ a = 1 }"), obj(&[("a", Value::Int(1))]));
+    assert_eq!(ok("\u{feff}{ a = 1 }"), obj(&[("a", Value::int(1))]));
 }
 
 #[test]
@@ -69,14 +72,14 @@ fn scalars_in_an_object() {
     assert_eq!(
         ok(input),
         obj(&[
-            ("t", Value::Bool(true)),
-            ("f", Value::Bool(false)),
-            ("n", Value::Null),
-            ("i", Value::Int(42)),
-            ("neg", Value::Int(-7)),
-            ("d", Value::Double(1.5)),
-            ("e", Value::Double(2000.0)),
-            ("ne", Value::Double(-0.0125)),
+            ("t", Value::from(true)),
+            ("f", Value::from(false)),
+            ("n", Value::null()),
+            ("i", Value::int(42)),
+            ("neg", Value::int(-7)),
+            ("d", Value::double(1.5)),
+            ("e", Value::double(2000.0)),
+            ("ne", Value::double(-0.0125)),
             ("str", s("hi")),
         ])
     );
@@ -88,13 +91,13 @@ fn integers_follow_the_binary_reader_mapping() {
     assert_eq!(
         ok(input),
         obj(&[
-            ("max", Value::Int(i64::MAX)),
-            ("min", Value::Int(i64::MIN)),
-            ("big", Value::UInt(1 << 63)),
-            ("top", Value::UInt(u64::MAX)),
-            ("hex", Value::Int(255)),
-            ("hexbig", Value::UInt(u64::MAX)),
-            ("neghex", Value::Int(-16)),
+            ("max", Value::int(i64::MAX)),
+            ("min", Value::int(i64::MIN)),
+            ("big", Value::uint(1 << 63)),
+            ("top", Value::uint(u64::MAX)),
+            ("hex", Value::uint(255)),
+            ("hexbig", Value::uint(u64::MAX)),
+            ("neghex", Value::int(-16)),
         ])
     );
 }
@@ -111,16 +114,16 @@ fn quoted_and_bare_keys() {
     assert_eq!(
         ok(r#"{ bare_key.x-1 = 1 "quoted key" = 2 "" = 3 }"#),
         obj(&[
-            ("bare_key.x-1", Value::Int(1)),
-            ("quoted key", Value::Int(2)),
-            ("", Value::Int(3)),
+            ("bare_key.x-1", Value::int(1)),
+            ("quoted key", Value::int(2)),
+            ("", Value::int(3)),
         ])
     );
 }
 
 #[test]
 fn members_may_be_separated_by_commas_or_newlines() {
-    let expected = obj(&[("a", Value::Int(1)), ("b", Value::Int(2))]);
+    let expected = obj(&[("a", Value::int(1)), ("b", Value::int(2))]);
     assert_eq!(ok("{ a = 1, b = 2 }"), expected);
     assert_eq!(ok("{ a = 1,\n b = 2, }"), expected);
     assert_eq!(ok("{\n a = 1\n b = 2\n}"), expected);
@@ -131,10 +134,10 @@ fn duplicate_keys_are_kept_in_order() {
     let v = ok("{ a = 1 a = 2 }");
     let o = v.as_object().unwrap();
     assert_eq!(o.len(), 2);
-    assert_eq!(o.get("a"), Some(&Value::Int(1)));
+    assert_eq!(o.get("a"), Some(&Value::int(1)));
     assert_eq!(
         o.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
-        vec![Value::Int(1), Value::Int(2)]
+        vec![Value::int(1), Value::int(2)]
     );
 }
 
@@ -144,17 +147,17 @@ fn arrays() {
         ok("{ a = [ 1, 2, 3 ] }"),
         obj(&[(
             "a",
-            Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+            Value::array(vec![Value::int(1), Value::int(2), Value::int(3)])
         )])
     );
-    assert_eq!(ok("{ a = [] }"), obj(&[("a", Value::Array(vec![]))]));
+    assert_eq!(ok("{ a = [] }"), obj(&[("a", Value::array(vec![]))]));
     assert_eq!(
         ok("{ a = [ \"x\", \"y\", ] }"),
-        obj(&[("a", Value::Array(vec![s("x"), s("y")]))])
+        obj(&[("a", Value::array(vec![s("x"), s("y")]))])
     );
     assert_eq!(
         ok("{ a = [\n 1\n 2\n] }"),
-        obj(&[("a", Value::Array(vec![Value::Int(1), Value::Int(2)]))])
+        obj(&[("a", Value::array(vec![Value::int(1), Value::int(2)]))])
     );
 }
 
@@ -166,7 +169,7 @@ fn nested_containers() {
             "a",
             obj(&[(
                 "b",
-                Value::Array(vec![obj(&[("c", Value::Null)]), Value::Array(vec![])])
+                Value::array(vec![obj(&[("c", Value::null())]), Value::array(vec![])])
             )])
         )])
     );
@@ -174,8 +177,8 @@ fn nested_containers() {
 
 #[test]
 fn root_may_be_any_value() {
-    assert_eq!(ok("[ 1 ]"), Value::Array(vec![Value::Int(1)]));
-    assert_eq!(ok("7"), Value::Int(7));
+    assert_eq!(ok("[ 1 ]"), Value::array(vec![Value::int(1)]));
+    assert_eq!(ok("7"), Value::int(7));
 }
 
 #[test]
@@ -215,9 +218,9 @@ fn comments_are_ignored() {
     assert_eq!(
         ok(input),
         obj(&[
-            ("a", Value::Int(1)),
-            ("b", Value::Int(2)),
-            ("c", Value::Array(vec![Value::Int(1)])),
+            ("a", Value::int(1)),
+            ("b", Value::int(2)),
+            ("c", Value::array(vec![Value::int(1)])),
         ])
     );
 }
@@ -231,26 +234,47 @@ fn comment_markers_inside_strings_are_text() {
 }
 
 #[test]
-fn resource_flags_are_dropped() {
+fn flag_prefixes_set_the_flag_byte() {
     let input = r#"{
         m = resource:"models/a.vmdl"
+        n = resource_name:"x"
         p = panorama:"file://{images}/x.png"
-        snd = soundevent:"Hero.Attack"
-        sub = subclass:"abilities/x"
+        snd = soundevent:"Unit.Attack"
+        sub = subclass:"classes/x"
         ml = resource:"""
 path
 """
+        both = resource:soundevent:"x"
+        spaced = resource: "y"
+        list = [ resource:"a", "b" ]
+        obj = subclass:{ k = 1 }
+        blob = resource:#[ 01 ]
     }"#;
+    let flagged = |v: Value, flags: u8| v.with_flags(flags);
     assert_eq!(
         ok(input),
         obj(&[
-            ("m", s("models/a.vmdl")),
-            ("p", s("file://{images}/x.png")),
-            ("snd", s("Hero.Attack")),
-            ("sub", s("abilities/x")),
-            ("ml", s("path")),
+            ("m", flagged(s("models/a.vmdl"), flag::RESOURCE)),
+            ("n", flagged(s("x"), flag::RESOURCE_NAME)),
+            ("p", flagged(s("file://{images}/x.png"), flag::PANORAMA)),
+            ("snd", flagged(s("Unit.Attack"), flag::SOUND_EVENT)),
+            ("sub", flagged(s("classes/x"), flag::SUBCLASS)),
+            ("ml", flagged(s("path"), flag::RESOURCE)),
+            ("both", flagged(s("x"), flag::RESOURCE | flag::SOUND_EVENT)),
+            ("spaced", flagged(s("y"), flag::RESOURCE)),
+            (
+                "list",
+                Value::array(vec![flagged(s("a"), flag::RESOURCE), s("b")])
+            ),
+            ("obj", flagged(obj(&[("k", Value::int(1))]), flag::SUBCLASS)),
+            ("blob", flagged(Value::blob(vec![1]), flag::RESOURCE)),
         ])
     );
+}
+
+#[test]
+fn prefixes_that_name_no_flag_are_refused() {
+    rejects(r#"{ a = made_up:"x" }"#);
 }
 
 #[test]
@@ -258,14 +282,14 @@ fn byte_blobs() {
     assert_eq!(
         ok("{ a = #[ 01 02 ff ] b = #[] c = #[0A0b] }"),
         obj(&[
-            ("a", Value::Blob(vec![1, 2, 255])),
-            ("b", Value::Blob(vec![])),
-            ("c", Value::Blob(vec![0x0a, 0x0b])),
+            ("a", Value::blob(vec![1, 2, 255])),
+            ("b", Value::blob(vec![])),
+            ("c", Value::blob(vec![0x0a, 0x0b])),
         ])
     );
     assert_eq!(
         ok("{ a = #[\n 00 11\n 22 33\n] }"),
-        obj(&[("a", Value::Blob(vec![0, 0x11, 0x22, 0x33]))])
+        obj(&[("a", Value::blob(vec![0, 0x11, 0x22, 0x33]))])
     );
 }
 

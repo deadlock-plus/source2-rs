@@ -24,7 +24,7 @@ fn build_kv3(payload: &[u8], compression: u32) -> Vec<u8> {
 fn kv3_header_reads_the_fields_the_decoder_needs() {
     let block = build_kv3(b"uncompressed body", 0);
     let h = crate::Header::parse(&block).expect("header");
-    assert_eq!(h.version, 5);
+    assert_eq!(h.version, crate::Version::V5);
     assert_eq!(h.compression, crate::Compression::None);
     assert_eq!(h.binary_byte_count, 7);
     assert_eq!(h.integer_count, 3);
@@ -84,8 +84,7 @@ fn build_kv3_compressed(compressed: &[u8], compression: u32, uncompressed_len: u
     out
 }
 
-/// LZ4 is not a legacy method Deadlock has left behind: eight of the ten
-/// `scripts/*.vdata_c` files it ships use it, and only `heroes` and `abilities` are zstd.
+/// LZ4 is the common method in shipped v5 files, with zstd the rarer one.
 #[cfg(feature = "lz4")]
 #[test]
 fn kv3_decodes_an_lz4_payload() {
@@ -97,6 +96,7 @@ fn kv3_decodes_an_lz4_payload() {
 
 /// The length check is what separates a real decode from a plausible-looking partial one,
 /// so it has to apply to LZ4 exactly as it does to zstd.
+#[cfg(feature = "lz4")]
 #[test]
 fn kv3_rejects_an_lz4_payload_that_decodes_to_the_wrong_length() {
     let body = b"eight!!!";
@@ -111,7 +111,7 @@ fn kv3_rejects_a_truncated_lz4_payload() {
     let mut lz4 = lz4_literal_block(body);
     lz4.truncate(lz4.len() - 10);
     let block = build_kv3_compressed(&lz4, 1, body.len() as u32);
-    assert!(matches!(crate::decode(&block), Err(Error::Malformed(_))));
+    assert!(matches!(crate::decode(&block), Err(Error::Compression(_))));
 }
 
 /// Knowing LZ4 must not turn the unknown-method refusal into a guess.
@@ -141,15 +141,15 @@ fn kv3_rejects_a_zstd_claim_with_no_zstd_frame() {
     assert!(format!("{err}").contains("zstd"), "{err}");
 }
 
-/// A hand-built KV3 v5 document, so the value model is covered without a game install.
+/// A hand-built KV3 v5 document, so the value model is covered without sample files.
 ///
 /// Encodes `{ "a": 1i32, "b": "xy" }`, and with `with_double` a third member `"c": 2.5`
 /// that gives buffer 2 a non-empty 8-byte pool.
 ///
 /// The two shapes exercise opposite sides of the alignment rule: a pool is preceded by
-/// padding to its own width only when it has entries. Deadlock ships both -
-/// `scripts/ranked_seasons.vdata_c` has an empty 8-byte pool and no padding before its
-/// type stream, while every larger file has entries and is padded.
+/// padding to its own width only when it has entries. Real files show both: a small one has an
+/// empty 8-byte pool and no padding before its type stream, while every larger file has
+/// entries and is padded.
 #[cfg(feature = "lz4")]
 fn build_kv3_v5_doc() -> Vec<u8> {
     build_kv3_v5_doc_with(false)
@@ -157,7 +157,7 @@ fn build_kv3_v5_doc() -> Vec<u8> {
 
 #[cfg(feature = "lz4")]
 fn build_kv3_v5_doc_with(with_double: bool) -> Vec<u8> {
-    use crate::value::node;
+    use crate::node;
 
     // Buffer 1: string blob, then the 4-byte pool whose first slot is the string count.
     let strings: &[&str] = if with_double {
@@ -276,11 +276,10 @@ fn value_model_rejects_an_out_of_range_string_index() {
 
 /// A pool with no entries is not preceded by padding.
 ///
-/// `scripts/ranked_seasons.vdata_c` is the file that proves it: its buffer 2 accounts for
-/// exactly its own length with no padding before the type stream, and padding
-/// unconditionally leaves four bytes too few for the trailer. Every other shipped file
-/// either has 8-byte entries or is already aligned, so this is the one shape that can
-/// tell the two rules apart.
+/// A small real file settles it: its buffer 2 accounts for exactly its own length with no
+/// padding before the type stream, and padding unconditionally leaves four bytes too few for
+/// the trailer. Every other file either has 8-byte entries or is already aligned, so this is
+/// the one shape that can tell the two rules apart.
 #[cfg(feature = "lz4")]
 #[test]
 fn value_model_does_not_pad_before_an_empty_pool() {
@@ -367,13 +366,13 @@ fn build_kv3_v4(
     out
 }
 
-/// A hand-built KV3 v4 document, so the older revision is covered without a game install.
+/// A hand-built KV3 v4 document, so the older revision is covered without sample files.
 ///
 /// Encodes `{ "a": 1i32, "b": "xy" }` - deliberately the shape [`build_kv3_v5_doc`]
 /// builds, so the two revisions can be asserted against identically.
 #[cfg(feature = "lz4")]
 fn build_kv3_v4_doc() -> Vec<u8> {
-    use crate::value::node;
+    use crate::node;
 
     let strings: &[&str] = &["a", "b", "xy"];
     let types = [node::OBJECT, node::INT32, node::STRING];
@@ -393,11 +392,10 @@ fn build_kv3_v4_doc() -> Vec<u8> {
 ///
 /// The array is `ARRAY_TYPE_BYTE_LENGTH`, so its length is drawn from the 1-byte pool -
 /// which also pushes the 4-byte pool off zero and makes its alignment observable. The
-/// double gives the 8-byte pool an entry. `scripts/ping_wheel_message_types.vdata_c` and
-/// `scripts/propdata.vdata_c` are the shipped files with those shapes.
+/// double gives the 8-byte pool an entry. Real files with those shapes exist.
 #[cfg(feature = "lz4")]
 fn build_kv3_v4_doc_with_pools() -> Vec<u8> {
-    use crate::value::node;
+    use crate::node;
 
     let strings: &[&str] = &["a", "list", "x", "y"];
     let types = [
@@ -437,8 +435,9 @@ fn value_model_reads_a_hand_built_v4_document() {
     use crate::Value;
 
     let doc = crate::parse(&build_kv3_v4_doc()).expect("parse");
-    assert_eq!(doc.header.version, 4);
-    assert_eq!(doc.header.payload_offset, 72);
+    assert_eq!(doc.options.version, crate::Version::V4);
+    let header = crate::Header::parse(&build_kv3_v4_doc()).expect("header");
+    assert_eq!(header.payload_offset, 72);
     let root = doc.root.as_object().expect("object");
     assert_eq!(root.len(), 2);
     assert_eq!(root.get("a").and_then(Value::as_i64), Some(1));
@@ -517,15 +516,4 @@ fn value_model_rejects_a_v4_string_count_larger_than_its_region() {
     doc[72..76].copy_from_slice(&u32::MAX.to_le_bytes());
     let err = crate::parse(&doc).unwrap_err();
     assert!(format!("{err}").contains("strings in a"), "{err}");
-}
-
-/// Reading v4 must not turn the refusal of older revisions into a guess: v3 lays its
-/// payload out differently again, and nothing Deadlock ships uses it.
-#[cfg(feature = "lz4")]
-#[test]
-fn value_model_still_refuses_a_revision_older_than_v4() {
-    let mut doc = build_kv3_v4_doc();
-    doc[0..4].copy_from_slice(&crate::MAGIC_V3.to_le_bytes());
-    let err = crate::parse(&doc).unwrap_err();
-    assert!(format!("{err}").contains("this is v3"), "{err}");
 }

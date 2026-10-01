@@ -1,134 +1,263 @@
-//! The binary KV3 writer: a value tree to a block the reader - and the game - can decode.
+//! The binary writer: a value tree to a block the reader can decode.
 //!
-//! The mirror of [`value`](crate::value). Encoding walks the tree once, in the order the
-//! reader will walk the type stream, and appends each operand to the pool its type reads
-//! from. The pools and the type stream are then laid out as the header describes them;
-//! see the reader's module docs for why the two revisions differ.
+//! The mirror of [`read`](crate::read). Encoding walks the tree once, in the order the reader
+//! will walk the type stream, and appends each operand to the pool its type reads from. The
+//! pools and the type stream are then laid out as the header describes them; see the reader's
+//! module docs for why the revisions differ.
 //!
 //! # Choices the format leaves open
 //!
-//! The reader accepts many encodings of the same value, so the writer picks one:
+//! The reader accepts many encodings of the same value. A value read from a file remembers the
+//! one the file used - flag bytes, integer and float widths, array forms - and the writer
+//! repeats it, so a document read with [`parse`](crate::parse) and written back is the same
+//! payload, byte for byte. Where a value carries no such memory, or can no longer hold it, or
+//! the target revision cannot store it, the writer picks the way Valve's shipped files usually
+//! do:
 //!
-//! - Integers take the narrowest of byte, 4-byte and 8-byte storage, with `0` and `1`
-//!   stored as type codes alone. The 2-byte pool is never written: v4 states no count
-//!   for it, and nothing Deadlock ships uses it.
-//! - Doubles are never narrowed to floats, so every `f64` round-trips bit for bit. `0.0`
-//!   and `1.0` are type codes alone.
-//! - Arrays are always the general form, one type code per element. The typed and
-//!   byte-length forms are a size optimisation only.
-//! - Strings are pooled by first use and shared between member names and values. The
-//!   empty string is the index `-1`, and takes no pool space.
+//! - Integers take the 4-byte type when they fit and the 8-byte one when not, with `0` and `1`
+//!   as type codes alone. Doubles are never narrowed, and `0.0` and `1.0` are type codes alone.
+//! - An array whose elements are all numbers of one type, strings, objects or arrays with one
+//!   type code and flag byte is stored as a typed array: element type once, then the elements,
+//!   which do not use the `0` and `1` shorthands. Anything else, including an empty array,
+//!   keeps a type code per element.
+//! - A typed array of up to 255 elements takes a 1-byte length, where the revision has one. On
+//!   v5, one of 4-byte integers, unsigned integers or doubles keeps its elements in the
+//!   auxiliary buffer. Longer arrays take a 4-byte length.
+//! - The 2-byte pool is written only when a tree has 2-byte scalars, and only where the
+//!   revision has one; v1 and v2 widen them to 4 bytes.
+//! - Strings are pooled by first use and shared between member names and values. The empty
+//!   string is the index `-1`, and takes no pool space.
+//!
+//! # Header counts
+//!
+//! v5 states three counts the reader ignores. They are written as Valve's files state them:
+//! offset 104 is the number of values that carry a type code of their own (typed array
+//! elements do not), 112 the number of arrays and 116 their element count with an empty array
+//! counting for one. Auxiliary-buffer arrays are left out of both unless they hold 32 elements
+//! or more.
 //!
 //! # Compression
 //!
-//! Both follow what Valve's files use, so the output is about the same size as theirs. LZ4
-//! is high-compression: level 9 for the buffers and level 12 for the blob chunks, one
-//! block per buffer or chunk. zstd is level 7 with the content checksum and size, one frame
-//! per buffer on v5.
+//! Both follow what Valve's files use. LZ4 is the reference high-compression encoder at level
+//! 12, from a built-in port, one block per buffer or chunk; the buffers of every LZ4 file
+//! checked re-encode to Valve's exact bytes. zstd is level 7 with the content checksum and
+//! size, one frame per buffer on v5; its output is about the size of Valve's but not the same
+//! bytes.
+//!
+//! # What is verified
+//!
+//! v4 and v5 are checked against shipped files, v1 and the original `VKV\x03` encoding against
+//! a sample set. v2 and v3 have no known sample: they are written from the layout the reader
+//! infers for them (v2 as v1 with the dictionary and frame fields in the header, v3 as v4).
 
 use std::collections::HashMap;
 
+use crate::compression::{LZ4_FRAME_SIZE, compress, compress_lz4_chunk};
 use crate::error::{Error, Result};
-use crate::value::{MAX_DEPTH, node};
-use crate::{Compression, MAGIC_V4, MAGIC_V5, Value};
-
-/// Which binary revision to write.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Version {
-    /// `KV3\x04`: one buffer, object lengths drawn from the 4-byte pool.
-    V4,
-    /// `KV3\x05`: two buffers, with a table for object lengths.
-    V5,
-}
+use crate::guid::GENERIC_FORMAT;
+use crate::header::{HEADER_LEN_V1, HEADER_LEN_V2, HEADER_LEN_V4, HEADER_LEN_V5};
+use crate::node::{self, default_scalar_type, scalar_bits};
+use crate::read::MAX_DEPTH;
+use crate::value::{ArrayForm, Kind, Storage};
+use crate::{Compression, Header, Value, Version};
 
 /// How to encode a document.
+///
+/// The defaults are Valve's usual choice: v5, the generic format, LZ4 (or the first codec the
+/// build has when `lz4` is off). Set only what differs:
+///
+/// ```
+/// use source2_kv3::{Compression, Version, WriteOptions};
+///
+/// let options = WriteOptions {
+///     version: Version::V4,
+///     compression: Compression::None,
+///     ..WriteOptions::default()
+/// };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriteOptions {
-    /// Revision to write.
+    /// Revision to write. All of [`Version`] can be written; `V2` and `V3` follow the layout the
+    /// reader infers, with no sample to check them against.
     pub version: Version,
-    /// Payload compression. [`Compression::Unknown`] is refused.
+    /// Payload compression. [`Version::Legacy`] takes [`None`](Compression::None),
+    /// [`Lz4`](Compression::Lz4) or [`Block`](Compression::Block); every other revision takes
+    /// `None`, `Lz4` or [`Zstd`](Compression::Zstd). [`Compression::Unknown`] is refused.
     pub compression: Compression,
     /// Format GUID stored in the header, identifying the schema the payload follows.
     pub format: [u8; 16],
+    /// Dictionary id stored in the header of revisions that have the field (v2 to v5). 0 in
+    /// every file seen.
+    pub dictionary_id: u16,
+    /// Frame size stored in the header of revisions that have the field (v2 to v5). With LZ4 a
+    /// value of 0 means 16384, the figure every LZ4 file seen declares, and it is also the
+    /// chunk length blobs are compressed in; with another compression the value is written as
+    /// given.
+    pub frame_size: u16,
 }
 
-/// Frame size Deadlock's LZ4 files declare. Advisory on read, so it is only written for
-/// fidelity.
-const LZ4_FRAME_SIZE: u16 = 16384;
+impl Default for WriteOptions {
+    fn default() -> Self {
+        WriteOptions {
+            version: Version::V5,
+            compression: default_compression(),
+            format: GENERIC_FORMAT,
+            dictionary_id: 0,
+            frame_size: 0,
+        }
+    }
+}
 
-/// The zstd level Valve's files were written at, judged by their sizes.
-#[cfg(feature = "zstd")]
-const ZSTD_LEVEL: i32 = 7;
+fn default_compression() -> Compression {
+    if cfg!(feature = "lz4") {
+        Compression::Lz4
+    } else if cfg!(feature = "zstd") {
+        Compression::Zstd
+    } else {
+        Compression::None
+    }
+}
 
-/// Marks the end of a KV3 document.
-const TRAILER: u32 = 0xFFEE_DD00;
+impl TryFrom<&Header> for WriteOptions {
+    type Error = Error;
 
-/// String index of the empty string.
-const EMPTY_STRING: u32 = u32::MAX;
-
-const HEADER_LEN_V5: usize = 120;
-const HEADER_LEN_V4: usize = 72;
-
-/// Encode a value tree as a binary KV3 block.
-///
-/// The result is what [`parse`](crate::parse) takes: a whole `DATA` block, header
-/// included.
-///
-/// # Errors
-///
-/// If the tree holds a [`Value::Blob`] and the version is v4, which has no blob area; a
-/// string containing NUL, which the string pool cannot represent;
-/// nesting deeper than the reader allows; or more data than the header's 32-bit sizes
-/// can describe. Also if the compression method is unknown, or its feature is not
-/// enabled.
-pub fn write(root: &Value, options: &WriteOptions) -> Result<Vec<u8>> {
-    let raw_compression = match options.compression {
-        Compression::None => 0u32,
-        Compression::Lz4 => 1,
-        Compression::Zstd => 2,
-        Compression::Unknown(v) => {
-            return Err(Error::Malformed(format!(
+    /// The options that reproduce a block's own layout: its revision, compression, format GUID,
+    /// dictionary id and frame size. Nothing is substituted.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] if the header names a compression method this crate does not
+    /// know, which no writer could repeat.
+    fn try_from(header: &Header) -> Result<Self> {
+        if let Compression::Unknown(v) = header.compression {
+            return Err(Error::Unsupported(format!(
                 "cannot write KV3 compression method {v}"
             )));
         }
-    };
+        Ok(WriteOptions {
+            version: header.version,
+            compression: header.compression,
+            format: header.format,
+            dictionary_id: header.dictionary_id,
+            frame_size: header.frame_size,
+        })
+    }
+}
 
-    let mut enc = Encoder::new(options.version);
-    enc.value(root, None, 0)?;
-
-    let mut header = match options.version {
-        Version::V5 => vec![0u8; HEADER_LEN_V5],
-        Version::V4 => vec![0u8; HEADER_LEN_V4],
-    };
-    let magic = match options.version {
-        Version::V5 => MAGIC_V5,
-        Version::V4 => MAGIC_V4,
-    };
-    put_u32(&mut header, field::MAGIC, magic);
-    header[field::FORMAT..field::FORMAT + 16].copy_from_slice(&options.format);
-    put_u32(&mut header, field::COMPRESSION, raw_compression);
-    if options.compression == Compression::Lz4 {
-        header[field::FRAME_SIZE..field::FRAME_SIZE + 2]
-            .copy_from_slice(&LZ4_FRAME_SIZE.to_le_bytes());
+impl WriteOptions {
+    /// The frame size LZ4 output uses, and so the chunk length of LZ4-compressed blobs.
+    fn lz4_chunk(&self) -> usize {
+        usize::from(if self.frame_size == 0 {
+            LZ4_FRAME_SIZE
+        } else {
+            self.frame_size
+        })
     }
 
-    let payload = match options.version {
-        Version::V5 => enc.finish_v5(&mut header, options.compression)?,
-        Version::V4 => enc.finish_v4(&mut header, options.compression)?,
+    fn check(&self) -> Result<()> {
+        let ok = match (self.version, self.compression) {
+            (_, Compression::Unknown(v)) => {
+                return Err(Error::Unsupported(format!(
+                    "cannot write KV3 compression method {v}"
+                )));
+            }
+            (Version::Legacy, Compression::None | Compression::Lz4 | Compression::Block) => true,
+            (Version::Legacy, _) => false,
+            (_, Compression::Block) => false,
+            _ => true,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::Unsupported(format!(
+                "no known KV3 file pairs {:?} with {:?} compression",
+                self.version, self.compression
+            )))
+        }
+    }
+}
+
+/// Encode a value tree as a binary KV3 block.
+///
+/// The result is what [`parse`](crate::parse) takes: a whole block, header included. A tree
+/// read with [`parse`](crate::parse) and written with the options it came with has the same
+/// decompressed payload as the block it came from. Values built by hand are stored the way
+/// Valve's files show; see the module docs.
+///
+/// Prefer [`Document::to_bytes`](crate::Document::to_bytes), which carries the options along.
+///
+/// # Errors
+///
+/// [`Error::Invalid`] if the tree holds a blob and the revision has no blob area (v3 and v4), a
+/// string containing NUL, which the string pool cannot represent, nesting deeper than the
+/// reader allows, or more data than the header's 32-bit sizes can describe;
+/// [`Error::Unsupported`] for an unknown compression method or one the revision does not pair
+/// with; [`Error::Compression`] if the codec is not enabled.
+pub fn write(root: &Value, options: &WriteOptions) -> Result<Vec<u8>> {
+    options.check()?;
+    match options.version {
+        Version::Legacy => crate::write_legacy::write_legacy(root, options),
+        version => write_pooled(root, options, version),
+    }
+}
+
+fn write_pooled(root: &Value, options: &WriteOptions, version: Version) -> Result<Vec<u8>> {
+    let mut enc = Encoder::new(version);
+    enc.value(root, None, 0, Slot::Free)?;
+
+    let header_len = match version {
+        Version::V5 => HEADER_LEN_V5,
+        Version::V3 | Version::V4 => HEADER_LEN_V4,
+        Version::V2 => HEADER_LEN_V2,
+        _ => HEADER_LEN_V1,
+    };
+    let mut header = vec![0u8; header_len];
+    put_u32(&mut header, field::MAGIC, version.magic());
+    header[field::FORMAT..field::FORMAT + 16].copy_from_slice(&options.format);
+    put_u32(&mut header, field::COMPRESSION, raw_compression(options)?);
+    let frame = if options.compression == Compression::Lz4 {
+        u16::try_from(options.lz4_chunk()).expect("frame size is a u16")
+    } else {
+        options.frame_size
+    };
+    if version != Version::V1 {
+        header[field::DICTIONARY_ID..field::DICTIONARY_ID + 2]
+            .copy_from_slice(&options.dictionary_id.to_le_bytes());
+        header[field::FRAME_SIZE..field::FRAME_SIZE + 2].copy_from_slice(&frame.to_le_bytes());
+    }
+
+    let payload = match version {
+        Version::V5 => enc.finish_v5(&mut header, options)?,
+        Version::V3 | Version::V4 => enc.finish_v4(&mut header, options.compression)?,
+        _ => enc.finish_flat(&mut header, options.compression)?,
     };
 
     header.extend_from_slice(&payload);
     Ok(header)
 }
 
+fn raw_compression(options: &WriteOptions) -> Result<u32> {
+    Ok(match options.compression {
+        Compression::None => 0,
+        Compression::Lz4 => 1,
+        Compression::Zstd => 2,
+        other => {
+            return Err(Error::Unsupported(format!(
+                "cannot write KV3 compression {other:?} in a numbered revision"
+            )));
+        }
+    })
+}
+
 /// Byte offsets of the header fields the writer sets.
 ///
-/// Fields the reader does not use are left zero, as they are in every shipped file this
-/// was checked against.
+/// Fields the reader does not use are left zero, as they are in every shipped file this was
+/// checked against.
 mod field {
     pub const MAGIC: usize = 0;
     pub const FORMAT: usize = 4;
     pub const COMPRESSION: usize = 20;
+    pub const DICTIONARY_ID: usize = 24;
     pub const FRAME_SIZE: usize = 26;
     pub const BINARY_BYTES: usize = 28;
     pub const INTEGERS: usize = 32;
@@ -138,28 +267,34 @@ mod field {
     pub const ARRAY_COUNT: usize = 46;
     pub const UNCOMPRESSED_SIZE: usize = 48;
     pub const COMPRESSED_SIZE: usize = 52;
+    pub const BLOB_COUNT: usize = 56;
+    pub const BLOB_TOTAL_SIZE: usize = 60;
+    pub const TWO_BYTES: usize = 64;
+    pub const BLOB_CHUNK_TABLE: usize = 68;
     pub const BUFFER1_UNCOMPRESSED: usize = 72;
     pub const BUFFER1_COMPRESSED: usize = 76;
     pub const BUFFER2_UNCOMPRESSED: usize = 80;
     pub const BUFFER2_COMPRESSED: usize = 84;
     pub const B2_BYTES: usize = 88;
+    pub const B2_TWO_BYTES: usize = 92;
     pub const B2_INTEGERS: usize = 96;
     pub const B2_EIGHT_BYTES: usize = 100;
-    pub const B2_OBJECTS: usize = 108;
     pub const VALUE_COUNT: usize = 104;
+    pub const B2_OBJECTS: usize = 108;
     pub const B2_ARRAYS: usize = 112;
     pub const B2_ARRAY_ELEMENTS: usize = 116;
-    pub const BLOB_COUNT: usize = 56;
-    pub const BLOB_TOTAL_SIZE: usize = 60;
 }
 
-fn put_u32(header: &mut [u8], at: usize, v: u32) {
+/// An auxiliary-buffer array this long or longer is counted among the arrays in the header.
+const COUNTED_AUXILIARY_LEN: usize = 32;
+
+pub(crate) fn put_u32(header: &mut [u8], at: usize, v: u32) {
     header[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-fn size(n: usize, what: &str) -> Result<u32> {
+pub(crate) fn size(n: usize, what: &str) -> Result<u32> {
     u32::try_from(n)
-        .map_err(|_| Error::Malformed(format!("KV3 {what} is {n}, too large for a 32-bit field")))
+        .map_err(|_| Error::Invalid(format!("KV3 {what} is {n}, too large for a 32-bit field")))
 }
 
 fn put_size(header: &mut [u8], at: usize, n: usize, what: &str) -> Result<()> {
@@ -171,21 +306,232 @@ fn pad_to(out: &mut Vec<u8>, width: usize) {
     out.resize(out.len().next_multiple_of(width), 0);
 }
 
+/// What a revision's layout can store.
+#[derive(Clone, Copy)]
+pub(crate) struct Layout {
+    pub version: Version,
+}
+
+impl Layout {
+    /// Whether arrays may state their length in one byte.
+    pub fn byte_length_arrays(self) -> bool {
+        !matches!(self.version, Version::Legacy | Version::V1 | Version::V2)
+    }
+
+    /// Whether arrays may keep their elements' operands in the auxiliary buffer.
+    pub fn auxiliary_arrays(self) -> bool {
+        self.version == Version::V5
+    }
+
+    /// Whether a scalar stored under type code `ty` has somewhere to live.
+    pub fn can_store_scalar(self, ty: u8) -> bool {
+        match ty {
+            node::INT16 | node::UINT16 => {
+                self.version.has_two_byte_pool() || self.version == Version::Legacy
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether the revision can hold a blob at all.
+    pub fn blobs(self) -> bool {
+        !self.version.is_single_buffer()
+    }
+}
+
+/// The 1, 2, 4 and 8-byte operand pools one buffer holds.
+#[derive(Default)]
+struct Pool {
+    bytes: Vec<u8>,
+    twos: Vec<u16>,
+    ints: Vec<u32>,
+    eights: Vec<u64>,
+}
+
+impl Pool {
+    /// Append the 2, 4 and 8-byte pools, each aligned to its width when it has entries.
+    /// `first_int` is a word the 4-byte pool opens with.
+    fn append_wide(&self, out: &mut Vec<u8>, first_int: Option<u32>) {
+        if !self.twos.is_empty() {
+            pad_to(out, 2);
+        }
+        for t in &self.twos {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        if !self.ints.is_empty() || first_int.is_some() {
+            pad_to(out, 4);
+        }
+        if let Some(first) = first_int {
+            out.extend_from_slice(&first.to_le_bytes());
+        }
+        for i in &self.ints {
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        if !self.eights.is_empty() {
+            pad_to(out, 8);
+        }
+        for e in &self.eights {
+            out.extend_from_slice(&e.to_le_bytes());
+        }
+    }
+}
+
+/// Whether a value opens with a type code of its own, or takes the one its array states.
+#[derive(Clone, Copy)]
+enum Slot {
+    Free,
+    Element(u8),
+}
+
+/// The longest array a 1-byte length can describe.
+pub(crate) const BYTE_LENGTH_MAX: usize = 255;
+
+/// Element types a typed array is given when nothing says how to store it.
+fn can_be_typed(ty: u8) -> bool {
+    matches!(
+        ty,
+        node::INT64
+            | node::UINT64
+            | node::DOUBLE
+            | node::STRING
+            | node::INT32
+            | node::UINT32
+            | node::OBJECT
+            | node::ARRAY
+            | node::ARRAY_TYPED
+            | node::ARRAY_TYPE_BYTE_LENGTH
+            | node::ARRAY_TYPE_AUXILIARY_BUFFER
+    )
+}
+
+pub(crate) fn array_code(form: ArrayForm) -> u8 {
+    match form {
+        ArrayForm::General => node::ARRAY,
+        ArrayForm::Typed { .. } => node::ARRAY_TYPED,
+        ArrayForm::ByteLength { .. } => node::ARRAY_TYPE_BYTE_LENGTH,
+        ArrayForm::Auxiliary { .. } => node::ARRAY_TYPE_AUXILIARY_BUFFER,
+    }
+}
+
+/// The layout an array is written in: the one it was read with while that still holds its
+/// elements, otherwise the default.
+pub(crate) fn plan_array(array: &Value, items: &[Value], layout: Layout) -> ArrayForm {
+    // Planned once per element and shared by both branches below, so the work does not double
+    // at every level of nesting.
+    let nested: Vec<Option<u8>> = items
+        .iter()
+        .map(|item| match item.kind() {
+            Kind::Array(inner) => Some(array_code(plan_array(item, inner, layout))),
+            _ => None,
+        })
+        .collect();
+    match array.storage() {
+        Storage::Array(form) if form_fits(form, items, &nested, layout) => form,
+        _ => default_form(items, &nested, layout),
+    }
+}
+
+fn form_fits(form: ArrayForm, items: &[Value], nested: &[Option<u8>], layout: Layout) -> bool {
+    let (ty, flags) = match form {
+        ArrayForm::General => return true,
+        ArrayForm::Typed { ty, flags } => (ty, flags),
+        ArrayForm::ByteLength { ty, flags } => {
+            if items.len() > BYTE_LENGTH_MAX || !layout.byte_length_arrays() {
+                return false;
+            }
+            (ty, flags)
+        }
+        ArrayForm::Auxiliary { ty, flags } => {
+            if items.len() > BYTE_LENGTH_MAX || !layout.auxiliary_arrays() {
+                return false;
+            }
+            (ty, flags)
+        }
+    };
+    items
+        .iter()
+        .zip(nested)
+        .all(|(item, &array)| item.flags() == flags && fits_element(item, array, ty, layout))
+}
+
+/// Whether `item` can be stored as an element of a typed array of type `ty`. `array` is the
+/// code of the item's own array layout, if it is an array.
+fn fits_element(item: &Value, array: Option<u8>, ty: u8, layout: Layout) -> bool {
+    match item.kind() {
+        Kind::String(_) => ty == node::STRING,
+        Kind::Blob(_) => ty == node::BINARY_BLOB,
+        Kind::Object(_) => ty == node::OBJECT,
+        Kind::Array(_) => array == Some(ty),
+        scalar => layout.can_store_scalar(ty) && scalar_bits(scalar, ty).is_some(),
+    }
+}
+
+/// The type code `item` gets as a member of a new typed array.
+fn default_element_code(item: &Value, array: Option<u8>) -> u8 {
+    match item.kind() {
+        Kind::String(_) => node::STRING,
+        Kind::Blob(_) => node::BINARY_BLOB,
+        Kind::Object(_) => node::OBJECT,
+        Kind::Array(_) => array.expect("arrays have a layout"),
+        scalar => default_scalar_type(scalar, false).expect("scalar kinds have a type"),
+    }
+}
+
+fn default_form(items: &[Value], nested: &[Option<u8>], layout: Layout) -> ArrayForm {
+    let (Some(first), Some(&first_array)) = (items.first(), nested.first()) else {
+        return ArrayForm::General;
+    };
+    let ty = default_element_code(first, first_array);
+    let flags = first.flags();
+    let uniform = can_be_typed(ty)
+        && items
+            .iter()
+            .zip(nested)
+            .all(|(item, &array)| item.flags() == flags && default_element_code(item, array) == ty);
+    if !uniform {
+        ArrayForm::General
+    } else if items.len() > BYTE_LENGTH_MAX || !layout.byte_length_arrays() {
+        ArrayForm::Typed { ty, flags }
+    } else if layout.auxiliary_arrays() && matches!(ty, node::DOUBLE | node::INT32 | node::UINT32) {
+        ArrayForm::Auxiliary { ty, flags }
+    } else {
+        ArrayForm::ByteLength { ty, flags }
+    }
+}
+
+/// The type code a scalar value is stored under: the one it was read with while that still
+/// holds it, otherwise Valve's usual.
+pub(crate) fn scalar_code(v: &Value, layout: Layout) -> u8 {
+    match v.storage() {
+        Storage::Scalar(ty)
+            if layout.can_store_scalar(ty) && scalar_bits(v.kind(), ty).is_some() =>
+        {
+            ty
+        }
+        _ => default_scalar_type(v.kind(), true).expect("scalar kinds have a type"),
+    }
+}
+
 /// The pools and type stream a document's values are drawn into.
 struct Encoder {
     version: Version,
+    layout: Layout,
     string_ids: HashMap<String, u32>,
     /// NUL-terminated strings, in pool order.
     string_blob: Vec<u8>,
     types: Vec<u8>,
-    bytes: Vec<u8>,
-    ints: Vec<u32>,
-    eights: Vec<u64>,
-    /// v5's table. Empty on v4, where counts go in `ints`.
+    /// The pools type codes draw from now, and the other set `Auxiliary` arrays swap to. Only
+    /// the first is used outside v5.
+    pools: [Pool; 2],
+    current: usize,
+    /// v5's table. Empty elsewhere, where counts go in the 4-byte pool.
     object_lengths: Vec<u32>,
     objects: usize,
     arrays: usize,
-    array_elements: usize,
+    /// Values that carry a type code of their own, which excludes the elements of typed arrays.
+    values: usize,
+    counted_arrays: usize,
+    counted_elements: usize,
     /// v5 only: stored after the two buffers rather than in a pool.
     blobs: Vec<Vec<u8>>,
 }
@@ -194,29 +540,35 @@ impl Encoder {
     fn new(version: Version) -> Self {
         Encoder {
             version,
+            layout: Layout { version },
             string_ids: HashMap::new(),
             string_blob: Vec::new(),
             types: Vec::new(),
-            bytes: Vec::new(),
-            ints: Vec::new(),
-            eights: Vec::new(),
+            pools: [Pool::default(), Pool::default()],
+            current: 0,
             object_lengths: Vec::new(),
             objects: 0,
             arrays: 0,
-            array_elements: 0,
+            values: 0,
+            counted_arrays: 0,
+            counted_elements: 0,
             blobs: Vec::new(),
         }
     }
 
+    fn pool(&mut self) -> &mut Pool {
+        &mut self.pools[self.current]
+    }
+
     fn string_id(&mut self, s: &str) -> Result<u32> {
         if s.is_empty() {
-            return Ok(EMPTY_STRING);
+            return Ok(crate::write_legacy::EMPTY_STRING);
         }
         if let Some(&id) = self.string_ids.get(s) {
             return Ok(id);
         }
         if s.contains('\0') {
-            return Err(Error::Malformed(
+            return Err(Error::Invalid(
                 "KV3 strings cannot contain NUL, it terminates them in the pool".into(),
             ));
         }
@@ -227,102 +579,168 @@ impl Encoder {
         Ok(id)
     }
 
-    fn array_length(&mut self, n: usize) -> Result<()> {
-        self.ints.push(size(n, "array length")?);
-        Ok(())
-    }
-
     fn object_length(&mut self, n: usize) -> Result<()> {
         let n = size(n, "object member count")?;
         match self.version {
             Version::V5 => self.object_lengths.push(n),
-            Version::V4 => self.ints.push(n),
+            _ => self.pool().ints.push(n),
         }
         Ok(())
     }
 
-    /// Append one value: its type code, its member name if it has one, then its operands
-    /// and children. This is the order the reader draws from the pools.
-    fn value(&mut self, value: &Value, name: Option<&str>, depth: u32) -> Result<()> {
+    fn type_code(&mut self, ty: u8, flags: u8) {
+        if flags == 0 {
+            self.types.push(ty);
+        } else {
+            self.types.push(ty | 0x80);
+            self.types.push(flags);
+        }
+    }
+
+    fn scalar(&mut self, ty: u8, bits: u64) {
+        let pool = self.pool();
+        match ty {
+            node::BOOLEAN | node::INT32_AS_BYTE => pool.bytes.push(bits as u8),
+            node::INT16 | node::UINT16 => pool.twos.push(bits as u16),
+            node::INT32 | node::UINT32 | node::FLOAT => pool.ints.push(bits as u32),
+            node::INT64 | node::UINT64 | node::DOUBLE => pool.eights.push(bits),
+            _ => {}
+        }
+    }
+
+    /// Append one value: its type code unless it is an element of a typed array, its member
+    /// name if it has one, then its operands and children. This is the order the reader draws
+    /// from the pools.
+    fn value(&mut self, v: &Value, name: Option<&str>, depth: u32, slot: Slot) -> Result<()> {
         if depth > MAX_DEPTH {
-            return Err(Error::Malformed(format!(
+            return Err(Error::Invalid(format!(
                 "KV3 nesting deeper than {MAX_DEPTH}, which the reader would refuse"
             )));
         }
-        let ty = match value {
-            Value::Null => node::NULL,
-            Value::Bool(true) => node::BOOLEAN_TRUE,
-            Value::Bool(false) => node::BOOLEAN_FALSE,
-            Value::Int(0) => node::INT64_ZERO,
-            Value::Int(1) => node::INT64_ONE,
-            Value::Int(v) if i8::try_from(*v).is_ok() => node::INT32_AS_BYTE,
-            Value::Int(v) if i32::try_from(*v).is_ok() => node::INT32,
-            Value::Int(_) => node::INT64,
-            Value::UInt(v) if u32::try_from(*v).is_ok() => node::UINT32,
-            Value::UInt(_) => node::UINT64,
-            Value::Double(v) if v.to_bits() == 0 => node::DOUBLE_ZERO,
-            Value::Double(v) if v.to_bits() == 1.0f64.to_bits() => node::DOUBLE_ONE,
-            Value::Double(_) => node::DOUBLE,
-            Value::String(_) => node::STRING,
-            Value::Array(_) => node::ARRAY,
-            Value::Object(_) => node::OBJECT,
-            Value::Blob(bytes) => {
-                if self.version == Version::V4 {
-                    return Err(Error::Malformed(
-                        "KV3 v4 has no blob area, so a blob value needs v5".into(),
-                    ));
-                }
-                self.blobs.push(bytes.clone());
-                node::BINARY_BLOB
-            }
+        let form = match v.kind() {
+            Kind::Array(items) => Some(plan_array(v, items, self.layout)),
+            _ => None,
         };
-        self.types.push(ty);
+        let code = match (v.kind(), form, slot) {
+            (Kind::String(_), ..) => node::STRING,
+            (Kind::Blob(_), ..) => node::BINARY_BLOB,
+            (Kind::Object(_), ..) => node::OBJECT,
+            (Kind::Array(_), Some(form), _) => array_code(form),
+            (_, _, Slot::Element(ty)) => ty,
+            (_, _, Slot::Free) => scalar_code(v, self.layout),
+        };
+        match slot {
+            Slot::Free => {
+                self.type_code(code, v.flags());
+                self.values += 1;
+            }
+            Slot::Element(ty) if ty != code => {
+                return Err(Error::Invalid(format!(
+                    "a KV3 array typed {ty} holds an element typed {code}"
+                )));
+            }
+            Slot::Element(_) => {}
+        }
         if let Some(name) = name {
             let id = self.string_id(name)?;
-            self.ints.push(id);
+            self.pool().ints.push(id);
         }
 
-        match value {
-            Value::Int(v) => match ty {
-                node::INT32_AS_BYTE => self.bytes.push(*v as i8 as u8),
-                node::INT32 => self.ints.push(*v as i32 as u32),
-                node::INT64 => self.eights.push(*v as u64),
-                _ => {}
-            },
-            Value::UInt(v) => match ty {
-                node::UINT32 => self.ints.push(*v as u32),
-                _ => self.eights.push(*v),
-            },
-            Value::Double(v) if ty == node::DOUBLE => self.eights.push(v.to_bits()),
-            Value::String(s) => {
+        match (v.kind(), form) {
+            (Kind::String(s), _) => {
                 let id = self.string_id(s)?;
-                self.ints.push(id);
+                self.pool().ints.push(id);
             }
-            Value::Array(items) => {
-                self.arrays += 1;
-                self.array_elements += items.len();
-                self.array_length(items.len())?;
-                for item in items {
-                    self.value(item, None, depth + 1)?;
+            (Kind::Blob(bytes), _) => {
+                if !self.layout.blobs() {
+                    return Err(Error::Invalid(
+                        "KV3 v3 and v4 have no blob area, so a blob value needs another revision"
+                            .into(),
+                    ));
+                }
+                if self.version == Version::V5 {
+                    self.blobs.push(bytes.clone());
+                } else {
+                    let len = size(bytes.len(), "blob")?;
+                    let pool = self.pool();
+                    pool.ints.push(len);
+                    pool.bytes.extend_from_slice(bytes);
                 }
             }
-            Value::Object(object) => {
+            (Kind::Array(items), Some(form)) => self.array(items, form, depth)?,
+            (Kind::Object(object), _) => {
                 self.objects += 1;
                 self.object_length(object.len())?;
                 for (key, member) in object.iter() {
-                    self.value(member, Some(key), depth + 1)?;
+                    self.value(member, Some(key), depth + 1, Slot::Free)?;
                 }
             }
-            _ => {}
+            (scalar, _) => {
+                let bits = scalar_bits(scalar, code).ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "a KV3 array typed {code} holds a value it cannot store"
+                    ))
+                })?;
+                self.scalar(code, bits);
+            }
         }
         Ok(())
     }
 
-    /// The counts both revisions state: how many objects and arrays the document holds.
+    fn array(&mut self, items: &[Value], form: ArrayForm, depth: u32) -> Result<()> {
+        let len = items.len();
+        self.arrays += 1;
+        if !matches!(form, ArrayForm::Auxiliary { .. }) || len >= COUNTED_AUXILIARY_LEN {
+            self.counted_arrays += 1;
+            self.counted_elements += len.max(1);
+        }
+
+        match form {
+            ArrayForm::General | ArrayForm::Typed { .. } => {
+                let n = size(len, "array length")?;
+                self.pool().ints.push(n);
+            }
+            ArrayForm::ByteLength { .. } | ArrayForm::Auxiliary { .. } => {
+                let n = u8::try_from(len).map_err(|_| {
+                    Error::Invalid(format!(
+                        "a byte-length KV3 array cannot hold {len} elements"
+                    ))
+                })?;
+                self.pool().bytes.push(n);
+            }
+        }
+        let (ty, flags) = match form {
+            ArrayForm::General => {
+                for item in items {
+                    self.value(item, None, depth + 1, Slot::Free)?;
+                }
+                return Ok(());
+            }
+            ArrayForm::Typed { ty, flags }
+            | ArrayForm::ByteLength { ty, flags }
+            | ArrayForm::Auxiliary { ty, flags } => (ty, flags),
+        };
+
+        self.type_code(ty, flags);
+        let auxiliary = matches!(form, ArrayForm::Auxiliary { .. });
+        if auxiliary {
+            self.current ^= 1;
+        }
+        let result = items
+            .iter()
+            .try_for_each(|item| self.value(item, None, depth + 1, Slot::Element(ty)));
+        if auxiliary {
+            self.current ^= 1;
+        }
+        result
+    }
+
+    /// The counts every pooled revision from v3 states: how many objects and arrays the
+    /// document holds.
     ///
-    /// Two 16-bit fields that real files fill in and this reader ignores. They saturate
-    /// rather than wrap, so a document past 65535 states a wrong figure that is at least
-    /// the right order of magnitude.
+    /// Two 16-bit fields that real files fill in and this reader ignores. They saturate rather
+    /// than wrap, so a document past 65535 states a wrong figure that is at least the right
+    /// order of magnitude.
     fn put_shape_counts(&self, header: &mut [u8]) {
         let clamp = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
         header[field::OBJECT_COUNT..field::OBJECT_COUNT + 2]
@@ -332,63 +750,68 @@ impl Encoder {
     }
 
     /// Lay out buffers 1 and 2, compress each, and fill in the v5 header.
-    fn finish_v5(self, header: &mut [u8], compression: Compression) -> Result<Vec<u8>> {
+    fn finish_v5(self, header: &mut [u8], options: &WriteOptions) -> Result<Vec<u8>> {
+        let compression = options.compression;
         let string_count = size(self.string_ids.len(), "string count")?;
+        let [main, aux] = &self.pools;
 
         let mut buf1 = self.string_blob.clone();
-        pad_to(&mut buf1, 4);
-        buf1.extend_from_slice(&string_count.to_le_bytes());
+        buf1.extend_from_slice(&aux.bytes);
+        let binary_bytes = buf1.len();
+        aux.append_wide(&mut buf1, Some(string_count));
 
         let mut buf2 = Vec::new();
         for l in &self.object_lengths {
             buf2.extend_from_slice(&l.to_le_bytes());
         }
-        buf2.extend_from_slice(&self.bytes);
-        if !self.ints.is_empty() {
-            pad_to(&mut buf2, 4);
-        }
-        for i in &self.ints {
-            buf2.extend_from_slice(&i.to_le_bytes());
-        }
-        if !self.eights.is_empty() {
-            pad_to(&mut buf2, 8);
-        }
-        for e in &self.eights {
-            buf2.extend_from_slice(&e.to_le_bytes());
-        }
+        buf2.extend_from_slice(&main.bytes);
+        main.append_wide(&mut buf2, None);
         buf2.extend_from_slice(&self.types);
         for b in &self.blobs {
             buf2.extend_from_slice(&size(b.len(), "blob")?.to_le_bytes());
         }
-        buf2.extend_from_slice(&TRAILER.to_le_bytes());
-        let (area, chunk_sizes) = blob_area(&self.blobs, compression)?;
+        buf2.extend_from_slice(&crate::decode::TRAILER_BYTES);
+        let (area, chunk_sizes) = blob_area(&self.blobs, compression, options.lz4_chunk())?;
         for c in &chunk_sizes {
             buf2.extend_from_slice(&c.to_le_bytes());
         }
 
+        put_size(header, field::BINARY_BYTES, binary_bytes, "buffer 1 bytes")?;
         put_size(
             header,
-            field::BINARY_BYTES,
-            self.string_blob.len(),
-            "string blob",
+            field::INTEGERS,
+            aux.ints.len() + 1,
+            "buffer 1 4-byte pool",
         )?;
-        put_u32(header, field::INTEGERS, 1);
+        put_size(
+            header,
+            field::EIGHT_BYTES,
+            aux.eights.len(),
+            "buffer 1 8-byte pool",
+        )?;
+        put_size(
+            header,
+            field::TWO_BYTES,
+            aux.twos.len(),
+            "buffer 1 2-byte pool",
+        )?;
         self.put_shape_counts(header);
-        put_size(header, field::VALUE_COUNT, self.types.len(), "value count")?;
-        put_size(header, field::B2_ARRAYS, self.arrays, "array count")?;
+        put_size(header, field::VALUE_COUNT, self.values, "value count")?;
+        put_size(header, field::B2_ARRAYS, self.counted_arrays, "array count")?;
         put_size(
             header,
             field::B2_ARRAY_ELEMENTS,
-            self.array_elements,
+            self.counted_elements,
             "array elements",
         )?;
         put_size(header, field::TYPE_COUNT, self.types.len(), "type stream")?;
-        put_size(header, field::B2_BYTES, self.bytes.len(), "1-byte pool")?;
-        put_size(header, field::B2_INTEGERS, self.ints.len(), "4-byte pool")?;
+        put_size(header, field::B2_BYTES, main.bytes.len(), "1-byte pool")?;
+        put_size(header, field::B2_TWO_BYTES, main.twos.len(), "2-byte pool")?;
+        put_size(header, field::B2_INTEGERS, main.ints.len(), "4-byte pool")?;
         put_size(
             header,
             field::B2_EIGHT_BYTES,
-            self.eights.len(),
+            main.eights.len(),
             "8-byte pool",
         )?;
         put_size(
@@ -401,6 +824,12 @@ impl Encoder {
         let blob_total: usize = self.blobs.iter().map(Vec::len).sum();
         put_size(header, field::BLOB_COUNT, self.blobs.len(), "blob count")?;
         put_size(header, field::BLOB_TOTAL_SIZE, blob_total, "blob total")?;
+        put_size(
+            header,
+            field::BLOB_CHUNK_TABLE,
+            chunk_sizes.len() * 2,
+            "blob chunk table",
+        )?;
 
         let c1 = compress(&buf1, compression)?;
         let c2 = compress(&buf2, compression)?;
@@ -442,35 +871,30 @@ impl Encoder {
         payload.extend_from_slice(&c2);
         if !self.blobs.is_empty() {
             payload.extend_from_slice(&area);
-            payload.extend_from_slice(&TRAILER.to_le_bytes());
+            payload.extend_from_slice(&crate::decode::TRAILER_BYTES);
         }
         Ok(payload)
     }
 
-    /// Lay out the single v4 buffer, compress it, and fill in the v4 header.
+    /// Lay out the single v3 or v4 buffer, compress it, and fill in the header.
     fn finish_v4(mut self, header: &mut [u8], compression: Compression) -> Result<Vec<u8>> {
         let string_count = size(self.string_ids.len(), "string count")?;
-        self.ints.insert(0, string_count);
+        let pool = &mut self.pools[0];
+        pool.ints.insert(0, string_count);
 
-        let mut payload = self.bytes.clone();
-        pad_to(&mut payload, 4);
-        for i in &self.ints {
-            payload.extend_from_slice(&i.to_le_bytes());
-        }
-        if !self.eights.is_empty() {
-            pad_to(&mut payload, 8);
-        }
-        for e in &self.eights {
-            payload.extend_from_slice(&e.to_le_bytes());
-        }
+        let mut payload = pool.bytes.clone();
+        pool.append_wide(&mut payload, None);
+        // The string blob starts on an 8-byte boundary even when the 8-byte pool is empty.
+        pad_to(&mut payload, 8);
         let region = self.string_blob.len() + self.types.len();
         payload.extend_from_slice(&self.string_blob);
         payload.extend_from_slice(&self.types);
-        payload.extend_from_slice(&TRAILER.to_le_bytes());
+        payload.extend_from_slice(&crate::decode::TRAILER_BYTES);
 
-        put_size(header, field::BINARY_BYTES, self.bytes.len(), "1-byte pool")?;
-        put_size(header, field::INTEGERS, self.ints.len(), "4-byte pool")?;
-        put_size(header, field::EIGHT_BYTES, self.eights.len(), "8-byte pool")?;
+        put_size(header, field::BINARY_BYTES, pool.bytes.len(), "1-byte pool")?;
+        put_size(header, field::INTEGERS, pool.ints.len(), "4-byte pool")?;
+        put_size(header, field::EIGHT_BYTES, pool.eights.len(), "8-byte pool")?;
+        put_size(header, field::TWO_BYTES, pool.twos.len(), "2-byte pool")?;
         self.put_shape_counts(header);
         put_size(header, field::TYPE_COUNT, region, "string and type region")?;
 
@@ -484,13 +908,46 @@ impl Encoder {
         )?;
         Ok(compressed)
     }
+
+    /// Lay out the v1 or v2 payload: bytes, 4-byte integers led by the string count, 8-byte
+    /// values, strings, the type stream and the trailer.
+    fn finish_flat(mut self, header: &mut [u8], compression: Compression) -> Result<Vec<u8>> {
+        let string_count = size(self.string_ids.len(), "string count")?;
+        let pool = &mut self.pools[0];
+        pool.ints.insert(0, string_count);
+
+        let mut payload = pool.bytes.clone();
+        pad_to(&mut payload, 4);
+        for i in &pool.ints {
+            payload.extend_from_slice(&i.to_le_bytes());
+        }
+        // The strings start on an 8-byte boundary whether or not there are 8-byte values.
+        pad_to(&mut payload, 8);
+        for e in &pool.eights {
+            payload.extend_from_slice(&e.to_le_bytes());
+        }
+        payload.extend_from_slice(&self.string_blob);
+        payload.extend_from_slice(&self.types);
+        payload.extend_from_slice(&crate::decode::TRAILER_BYTES);
+
+        let counts = header.len() - 16;
+        put_size(header, counts, pool.bytes.len(), "1-byte pool")?;
+        put_size(header, counts + 4, pool.ints.len(), "4-byte pool")?;
+        put_size(header, counts + 8, pool.eights.len(), "8-byte pool")?;
+        put_size(header, counts + 12, payload.len(), "payload")?;
+        compress(&payload, compression)
+    }
 }
 
 /// The compressed blob area, and on LZ4 the compressed length of each chunk.
 ///
-/// LZ4 compresses each blob in chunks of the frame size, one block per chunk, which the
-/// reader undoes chunk by chunk. zstd takes the blobs back to back as a single stream.
-fn blob_area(blobs: &[Vec<u8>], compression: Compression) -> Result<(Vec<u8>, Vec<u16>)> {
+/// LZ4 compresses each blob in chunks of the frame size, one block per chunk, which the reader
+/// undoes chunk by chunk. zstd takes the blobs back to back as a single stream.
+fn blob_area(
+    blobs: &[Vec<u8>],
+    compression: Compression,
+    chunk_len: usize,
+) -> Result<(Vec<u8>, Vec<u16>)> {
     let mut chunk_sizes = Vec::new();
     if blobs.is_empty() {
         return Ok((Vec::new(), chunk_sizes));
@@ -499,14 +956,11 @@ fn blob_area(blobs: &[Vec<u8>], compression: Compression) -> Result<(Vec<u8>, Ve
         Compression::Lz4 => {
             let mut area = Vec::new();
             let mut stream: Vec<u8> = Vec::new();
-            for chunk in blobs
-                .iter()
-                .flat_map(|b| b.chunks(usize::from(LZ4_FRAME_SIZE)))
-            {
+            for chunk in blobs.iter().flat_map(|b| b.chunks(chunk_len)) {
                 let block = compress_lz4_chunk(chunk, &stream)?;
                 stream.extend_from_slice(chunk);
                 chunk_sizes.push(u16::try_from(block.len()).map_err(|_| {
-                    Error::Malformed("KV3 blob chunk does not fit a 16-bit length".into())
+                    Error::Invalid("KV3 blob chunk does not fit a 16-bit length".into())
                 })?);
                 area.extend_from_slice(&block);
             }
@@ -515,66 +969,4 @@ fn blob_area(blobs: &[Vec<u8>], compression: Compression) -> Result<(Vec<u8>, Ve
         other => compress(&blobs.concat(), other)?,
     };
     Ok((area, chunk_sizes))
-}
-
-pub(crate) fn compress(raw: &[u8], compression: Compression) -> Result<Vec<u8>> {
-    match compression {
-        Compression::None => Ok(raw.to_vec()),
-        Compression::Lz4 => compress_lz4(raw),
-        Compression::Zstd => compress_zstd(raw),
-        Compression::Unknown(v) => Err(Error::Malformed(format!(
-            "cannot write KV3 compression method {v}"
-        ))),
-    }
-}
-
-#[cfg(feature = "lz4")]
-fn compress_lz4(raw: &[u8]) -> Result<Vec<u8>> {
-    Ok(crate::lz4_hc::compress(&[], raw, crate::lz4_hc::Level::L9))
-}
-
-/// One blob chunk, free to match against the last 64 KiB of the chunks before it, which
-/// is the window the reader decodes it against.
-#[cfg(feature = "lz4")]
-fn compress_lz4_chunk(chunk: &[u8], stream: &[u8]) -> Result<Vec<u8>> {
-    let window = &stream[stream.len().saturating_sub(crate::LZ4_WINDOW)..];
-    Ok(crate::lz4_hc::compress(
-        window,
-        chunk,
-        crate::lz4_hc::Level::L12,
-    ))
-}
-
-#[cfg(not(feature = "lz4"))]
-fn compress_lz4_chunk(_chunk: &[u8], _stream: &[u8]) -> Result<Vec<u8>> {
-    compress_lz4(&[])
-}
-
-#[cfg(not(feature = "lz4"))]
-fn compress_lz4(_raw: &[u8]) -> Result<Vec<u8>> {
-    Err(Error::Malformed(
-        "this build cannot write LZ4; enable the `lz4` feature".into(),
-    ))
-}
-
-#[cfg(feature = "zstd")]
-fn compress_zstd(raw: &[u8]) -> Result<Vec<u8>> {
-    let config = zstd_rs::CompressionConfig {
-        level: ZSTD_LEVEL,
-        checksum: true,
-        content_size: true,
-        ..zstd_rs::CompressionConfig::DEFAULT
-    };
-    let mut frame = Vec::new();
-    zstd_rs::Compressor::new(config)
-        .and_then(|mut c| c.compress(raw, None, &mut frame))
-        .map_err(|e| Error::Malformed(format!("zstd encode: {e}")))?;
-    Ok(frame)
-}
-
-#[cfg(not(feature = "zstd"))]
-fn compress_zstd(_raw: &[u8]) -> Result<Vec<u8>> {
-    Err(Error::Malformed(
-        "this build cannot write zstd; enable the `zstd` feature".into(),
-    ))
 }

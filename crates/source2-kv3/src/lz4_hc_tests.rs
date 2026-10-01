@@ -85,10 +85,10 @@ fn noise(len: usize, mut seed: u64) -> Vec<u8> {
 /// Text built from a small vocabulary, so there are many near-equal matches to choose from.
 fn word_soup(len: usize, mut seed: u64) -> Vec<u8> {
     const VOCAB: [&str; 12] = [
-        "ability_",
-        "hero_inferno",
+        "module_",
+        "inferno_wave",
         "upgrade",
-        "citadel_",
+        "station_",
         "mod_category",
         "spirit",
         "weapon",

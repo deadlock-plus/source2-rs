@@ -1,33 +1,58 @@
 //! Text KV3 reader.
 
 use crate::error::{Error, Result};
-use crate::value::{MAX_DEPTH, Object, Value};
+use crate::guid::{GENERIC_FORMAT, parse_guid};
+use crate::read::MAX_DEPTH;
+use crate::value::flag;
+use crate::{Document, Object, Tag, TextHeader, Value, WriteOptions};
 
-/// Parse a text KV3 document into its root value.
+/// Parse a text KV3 document.
 ///
 /// The `<!-- kv3 ... -->` header is optional, but one that is present must name both an
-/// `encoding` and a `format`. Resource flags such as `resource:"path"` are accepted and
-/// dropped, since [`Value`] has nowhere to keep them. Integers map as the binary reader
-/// does: [`Value::Int`] when they fit an `i64`, [`Value::UInt`] only above that.
+/// `encoding` and a `format`, each as `name:version{guid}`; both are kept in the returned
+/// [`Document`] so [`write_text`](crate::write_text) can state them again. Without a header the
+/// document is the generic format.
+///
+/// Flag prefixes such as `resource:"path"` set the matching [`flag`] bits on the value they
+/// precede. A prefix that names no flag is an error, since keeping the value would drop the
+/// prefix silently. Decimal integers are [`Kind::Int`](crate::Kind::Int) when they fit an `i64`
+/// and [`Kind::UInt`](crate::Kind::UInt) above that; hexadecimal ones (`0x...`) are always
+/// `UInt`, which is how [`write_text`](crate::write_text) spells an unsigned value. `"""`
+/// strings read as [`Value::multiline`].
+///
+/// # What text drops
+///
+/// Comments (`//` and `/* */`) are read past and not kept, key quoting and layout are
+/// regenerated on writing, and a text file has no integer widths, float widths or array layouts
+/// to remember. A document read from text carries [`WriteOptions::default`] apart from the
+/// format GUID.
 ///
 /// # Errors
 ///
-/// On any syntax the reader does not accept: an unterminated string, comment, object,
-/// array or blob, a stray token, an unparseable or out-of-range number, a malformed
-/// header, or nesting deeper than the binary reader allows.
-pub fn parse_text(input: &str) -> Result<Value> {
+/// [`Error::Syntax`] on any syntax the reader does not accept: an unterminated string, comment,
+/// object, array or blob, a stray token, an unparseable or out-of-range number (`nan` and `inf`
+/// have no spelling and are refused), a malformed header, an unknown flag prefix, or nesting
+/// deeper than the binary reader allows.
+pub fn parse_text(input: &str) -> Result<Document> {
     let mut p = Parser {
         src: input.strip_prefix('\u{feff}').unwrap_or(input),
         pos: 0,
     };
-    p.header()?;
+    let (text, format) = p.header()?;
     p.skip_trivia()?;
     let root = p.value(0)?;
     p.skip_trivia()?;
     if !p.at_end() {
         return Err(p.err("unexpected content after the root value"));
     }
-    Ok(root)
+    Ok(Document {
+        root,
+        options: WriteOptions {
+            format,
+            ..WriteOptions::default()
+        },
+        text,
+    })
 }
 
 struct Parser<'a> {
@@ -49,7 +74,10 @@ impl<'a> Parser<'a> {
             .iter()
             .filter(|&&b| b == b'\n')
             .count();
-        Error::Malformed(format!("text KV3 line {line}: {msg}"))
+        Error::Syntax {
+            line,
+            message: msg.to_string(),
+        }
     }
 
     fn at_end(&self) -> bool {
@@ -73,12 +101,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn header(&mut self) -> Result<()> {
+    fn header(&mut self) -> Result<(TextHeader, [u8; 16])> {
         let start = self.pos;
         self.skip_whitespace();
         if !self.rest().starts_with("<!--") {
             self.pos = start;
-            return Ok(());
+            return Ok((TextHeader::default(), GENERIC_FORMAT));
         }
         let body_start = self.pos + 4;
         let end = self
@@ -90,31 +118,40 @@ impl<'a> Parser<'a> {
         if words.next() != Some("kv3") {
             return Err(self.err("header comment is not a kv3 header"));
         }
-        let (mut encoding, mut format) = (false, false);
+        let (mut encoding, mut format) = (None, None);
         for word in words {
             let mut parts = word.splitn(3, ':');
             let (key, name, version) = (parts.next(), parts.next(), parts.next());
-            let well_formed = name.is_some_and(|n| !n.is_empty())
-                && version.is_some_and(|v| {
-                    v.strip_prefix("version{")
-                        .is_some_and(|g| g.ends_with('}') && g.len() > 1)
-                });
-            if !well_formed {
+            let guid = version
+                .and_then(|v| v.strip_prefix("version{"))
+                .and_then(|g| g.strip_suffix('}'))
+                .and_then(parse_guid);
+            let (Some(name), Some(guid)) = (name.filter(|n| !n.is_empty()), guid) else {
                 return Err(self.err(&format!(
                     "header field {word:?} is not name:version{{guid}}"
                 )));
-            }
+            };
+            let tag = Tag {
+                name: name.to_string(),
+                guid,
+            };
             match key {
-                Some("encoding") => encoding = true,
-                Some("format") => format = true,
+                Some("encoding") => encoding = Some(tag),
+                Some("format") => format = Some(tag),
                 _ => return Err(self.err(&format!("unknown header field {word:?}"))),
             }
         }
-        if !(encoding && format) {
+        let (Some(encoding), Some(format)) = (encoding, format) else {
             return Err(self.err("header must name both an encoding and a format"));
-        }
+        };
         self.pos += end + 3;
-        Ok(())
+        Ok((
+            TextHeader {
+                encoding,
+                format_name: format.name,
+            },
+            format.guid,
+        ))
     }
 
     fn skip_whitespace(&mut self) {
@@ -147,6 +184,35 @@ impl<'a> Parser<'a> {
         if depth > MAX_DEPTH {
             return Err(self.err(&format!("nesting deeper than {MAX_DEPTH}")));
         }
+        let flags = self.flags()?;
+        let value = self.unflagged(depth)?;
+        let flags = flags | value.flags();
+        Ok(value.with_flags(flags))
+    }
+
+    /// Consume any `name:` prefixes in front of a value and return the flag bits they name.
+    fn flags(&mut self) -> Result<u8> {
+        let mut bits = 0;
+        loop {
+            let start = self.pos;
+            while self.peek().is_some_and(is_bare_key) {
+                self.pos += 1;
+            }
+            if self.pos == start || !self.eat(b':') {
+                self.pos = start;
+                return Ok(bits);
+            }
+            let name = &self.src[start..self.pos - 1];
+            let Some((bit, _)) = flag::NAMES.iter().find(|(_, n)| *n == name) else {
+                self.pos = start;
+                return Err(self.err(&format!("`{name}:` is not a flag prefix")));
+            };
+            bits |= bit;
+            self.skip_trivia()?;
+        }
+    }
+
+    fn unflagged(&mut self, depth: u32) -> Result<Value> {
         match self.peek() {
             None => Err(self.err("expected a value, found the end of the input")),
             Some(b'{') => {
@@ -161,20 +227,21 @@ impl<'a> Parser<'a> {
                 self.pos += 2;
                 self.blob()
             }
-            Some(b'"') => Ok(Value::String(self.string()?)),
-            Some(_) => self.word(depth),
+            Some(b'"') if self.rest().starts_with("\"\"\"") => Ok(Value::multiline(self.string()?)),
+            Some(b'"') => Ok(Value::from(self.string()?)),
+            Some(_) => self.word(),
         }
     }
 
     fn object(&mut self, depth: u32) -> Result<Value> {
-        let mut object = Object::default();
+        let mut object = Object::new();
         loop {
             self.skip_trivia()?;
             match self.peek() {
                 None => return Err(self.err("object is not closed")),
                 Some(b'}') => {
                     self.pos += 1;
-                    return Ok(Value::Object(object));
+                    return Ok(Value::from(object));
                 }
                 _ => {}
             }
@@ -185,7 +252,7 @@ impl<'a> Parser<'a> {
             }
             self.skip_trivia()?;
             let value = self.value(depth + 1)?;
-            object.insert(key, value);
+            object.push(key, value);
             self.skip_trivia()?;
             self.eat(b',');
         }
@@ -199,7 +266,7 @@ impl<'a> Parser<'a> {
                 None => return Err(self.err("array is not closed")),
                 Some(b']') => {
                     self.pos += 1;
-                    return Ok(Value::Array(items));
+                    return Ok(Value::from(items));
                 }
                 _ => {}
             }
@@ -322,7 +389,7 @@ impl<'a> Parser<'a> {
                 None => return Err(self.err("byte array is not closed")),
                 Some(b']') => {
                     self.pos += 1;
-                    return Ok(Value::Blob(bytes));
+                    return Ok(Value::blob(bytes));
                 }
                 Some(_) => {}
             }
@@ -345,8 +412,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A bare token: a keyword, a number, or the flag in front of another value.
-    fn word(&mut self, depth: u32) -> Result<Value> {
+    /// A bare token: a keyword or a number.
+    fn word(&mut self) -> Result<Value> {
         let start = self.pos;
         while self.peek().is_some_and(|b| !is_delimiter(b)) {
             self.pos += 1;
@@ -356,17 +423,10 @@ impl<'a> Parser<'a> {
             return Err(self.err("unexpected character"));
         }
         match token {
-            "true" => return Ok(Value::Bool(true)),
-            "false" => return Ok(Value::Bool(false)),
-            "null" => return Ok(Value::Null),
+            "true" => return Ok(Value::from(true)),
+            "false" => return Ok(Value::from(false)),
+            "null" => return Ok(Value::null()),
             _ => {}
-        }
-        if let Some(flag) = token.strip_suffix(':')
-            && !flag.is_empty()
-            && flag.bytes().all(is_bare_key)
-        {
-            self.skip_trivia()?;
-            return self.value(depth);
         }
         number(token).ok_or_else(|| {
             self.pos = start;
@@ -392,23 +452,28 @@ fn number(token: &str) -> Option<Value> {
         .strip_prefix("0x")
         .or_else(|| digits.strip_prefix("0X"))
     {
-        return integer(u64::from_str_radix(hex, 16).ok()?, negative);
+        let magnitude = u64::from_str_radix(hex, 16).ok()?;
+        return if negative {
+            integer(magnitude, true)
+        } else {
+            Some(Value::uint(magnitude))
+        };
     }
     if digits.bytes().all(|b| b.is_ascii_digit()) {
         return integer(digits.parse::<u64>().ok()?, negative);
     }
     let float = token.parse::<f64>().ok()?;
-    float.is_finite().then_some(Value::Double(float))
+    float.is_finite().then_some(Value::double(float))
 }
 
 fn integer(magnitude: u64, negative: bool) -> Option<Value> {
     if negative {
         let value = i64::try_from(i128::from(magnitude).checked_neg()?).ok()?;
-        Some(Value::Int(value))
+        Some(Value::int(value))
     } else {
         Some(match i64::try_from(magnitude) {
-            Ok(v) => Value::Int(v),
-            Err(_) => Value::UInt(magnitude),
+            Ok(v) => Value::int(v),
+            Err(_) => Value::uint(magnitude),
         })
     }
 }

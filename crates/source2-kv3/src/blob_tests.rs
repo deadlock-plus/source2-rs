@@ -1,4 +1,4 @@
-//! Standalone KV3 files whose binary blobs trail the two buffers, as in Steam cloud files.
+//! Standalone KV3 files whose binary blobs trail the two buffers.
 
 use crate::{Compression, Object, Value, parse};
 
@@ -14,7 +14,7 @@ struct Tail {
     area: Vec<u8>,
 }
 
-/// `{ "k": <blob>, "k": <blob>, ... }` laid out the way shipped standalone files are:
+/// `{ "k": <blob>, "k": <blob>, ... }` laid out the way real standalone files are:
 /// buffers 1 and 2, then the blob area, then a closing trailer.
 ///
 /// Buffer 2 ends with each blob's uncompressed length as a u32, the buffer trailer, and on
@@ -105,9 +105,9 @@ fn lz4_tail(blobs: &[&[u8]]) -> Tail {
 fn expected(blobs: &[&[u8]]) -> Value {
     let mut o = Object::default();
     for b in blobs {
-        o.insert("k".to_string(), Value::Blob(b.to_vec()));
+        o.push("k".to_string(), Value::blob(b.to_vec()));
     }
-    Value::Object(o)
+    Value::from(o)
 }
 
 #[test]

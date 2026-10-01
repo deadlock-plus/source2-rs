@@ -1,8 +1,8 @@
 [package]
 name = "source2-kv3"
-description = "Reader for Valve's binary KeyValues 3 (KV3)"
-keywords = ["source2", "kv3", "keyvalues", "valve"]
-categories = ["game-development", "parser-implementations"]
+description = "Reader and writer for Valve's KeyValues 3 (KV3): binary v1 to v5 and the original VKV encoding, and text"
+keywords = ["source2", "kv3", "keyvalues", "valve", "serialization"]
+categories = ["game-development", "parser-implementations", "encoding"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
