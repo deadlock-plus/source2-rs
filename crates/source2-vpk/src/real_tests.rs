@@ -1,6 +1,8 @@
 //! Tests against real packs. They need a directory of `.vpk` files named by the
 //! `SOURCE2_VPK_SAMPLES` environment variable and skip (pass without checking anything)
-//! when it is unset. The test that reads every archive in full is also `#[ignore]`d.
+//! when it is unset. A check with nothing comparable in the packs found (some shipped
+//! packs carry no checkable archive MD5 records) also skips; it fails only on a real
+//! mismatch. The test that reads every archive in full is also `#[ignore]`d.
 //!
 //! Run the full set with `cargo test -p source2-vpk --release -- --include-ignored`.
 
@@ -112,12 +114,9 @@ fn entries_read_with_matching_crcs() {
     }
 }
 
-fn check_archive_records(limit: Option<u64>) {
-    let Some(packs) = packs() else {
-        return;
-    };
+fn check_archive_records_in(packs: &[PathBuf], limit: Option<u64>) -> usize {
     let mut matched = 0;
-    for path in &packs {
+    for path in packs {
         let vpk = Vpk::open(path).unwrap();
         if limit.is_some_and(|l| archive_bytes(&vpk) > l) {
             continue;
@@ -132,7 +131,16 @@ fn check_archive_records(limit: Option<u64>) {
         );
         matched += report.matched;
     }
-    assert!(matched > 0, "no record could be checked");
+    matched
+}
+
+fn check_archive_records(limit: Option<u64>) {
+    let Some(packs) = packs() else {
+        return;
+    };
+    if check_archive_records_in(&packs, limit) == 0 {
+        eprintln!("no archive MD5 record could be checked; skipping");
+    }
 }
 
 #[test]
@@ -146,16 +154,9 @@ fn checkable_archive_md5_records_of_every_pack_verify() {
     check_archive_records(None);
 }
 
-/// The records of numbered archives in shipped files use an index spelling whose digests
-/// are not plain MD5 of the archive bytes, so they come back as unchecked rather than as
-/// failures. This pins that behaviour to real data.
-#[test]
-fn shipped_numbered_archive_records_are_reported_unchecked() {
-    let Some(packs) = packs() else {
-        return;
-    };
+fn pin_unchecked_records_in(packs: &[PathBuf]) -> usize {
     let mut seen = 0;
-    for path in &packs {
+    for path in packs {
         let vpk = Vpk::open(path).unwrap();
         let has_flagged = vpk
             .archive_md5
@@ -168,21 +169,29 @@ fn shipped_numbered_archive_records_are_reported_unchecked() {
             seen += 1;
         }
     }
-    assert!(seen > 0);
+    seen
 }
 
-/// Dropping the records and writing again must regenerate what the tools that made an
-/// inline-only pack wrote, which pins the chunking and index spelling used for the
-/// inline data of hand-built documents.
+/// The records of numbered archives in shipped files use an index spelling whose digests
+/// are not plain MD5 of the archive bytes, so they come back as unchecked rather than as
+/// failures. This pins that behaviour to real data.
 #[test]
-fn regenerated_inline_md5_records_match_the_shipped_ones() {
+fn shipped_numbered_archive_records_are_reported_unchecked() {
     let Some(packs) = packs() else {
         return;
     };
+    if pin_unchecked_records_in(&packs) == 0 {
+        eprintln!("no pack has flagged archive records; skipping");
+    }
+}
+
+fn regenerated_records_match_in(packs: &[PathBuf]) -> usize {
     let mut compared = 0;
-    for path in &packs {
+    for path in packs {
         let vpk = Vpk::open(path).unwrap();
-        let records = vpk.archive_md5.clone().unwrap();
+        let Some(records) = vpk.archive_md5.clone() else {
+            continue;
+        };
         let inline_only =
             !records.is_empty() && records.iter().all(|r| r.target() == Md5Target::Inline);
         let no_archives = vpk
@@ -202,5 +211,78 @@ fn regenerated_inline_md5_records_match_the_shipped_ones() {
         );
         compared += 1;
     }
-    assert!(compared > 0, "nothing was comparable");
+    compared
+}
+
+/// Dropping the records and writing again must regenerate what the tools that made an
+/// inline-only pack wrote, which pins the chunking and index spelling used for the
+/// inline data of hand-built documents.
+#[test]
+fn regenerated_inline_md5_records_match_the_shipped_ones() {
+    let Some(packs) = packs() else {
+        return;
+    };
+    if regenerated_records_match_in(&packs) == 0 {
+        eprintln!("no inline-only pack with records; skipping");
+    }
+}
+
+mod synthetic {
+    use super::*;
+    use crate::tests::TempDir;
+
+    const PAYLOAD: &[u8] = b"synthetic inline payload";
+
+    fn inline_pack(tag: &str, corrupt: bool, flagged: bool) -> (TempDir, Vec<PathBuf>) {
+        let t = TempDir::new(tag);
+        let path = t.path().join("pack_dir.vpk");
+        let mut v = Vpk::new(2);
+        v.archive_md5 = Some(Vec::new());
+        v.push(Entry::inline("docs/a.txt", PAYLOAD.to_vec()));
+        v.write(&path).unwrap();
+        if flagged {
+            let mut parsed = Vpk::open(&path).unwrap();
+            parsed.archive_md5 = Some(vec![ArchiveMd5 {
+                archive_index: 0x1_0000,
+                offset: 0,
+                length: PAYLOAD.len() as u32,
+                md5: [7; 16],
+            }]);
+            parsed.write(&path).unwrap();
+        }
+        if corrupt {
+            let mut bytes = std::fs::read(&path).unwrap();
+            let at = bytes
+                .windows(PAYLOAD.len())
+                .position(|w| w == PAYLOAD)
+                .unwrap();
+            bytes[at] ^= 0xff;
+            std::fs::write(&path, bytes).unwrap();
+        }
+        (t, vec![path])
+    }
+
+    #[test]
+    fn a_clean_pack_is_comparable_in_every_check() {
+        let (_t, packs) = inline_pack("real-clean", false, false);
+        assert!(check_archive_records_in(&packs, None) > 0);
+        assert!(regenerated_records_match_in(&packs) > 0);
+        let (_t, packs) = inline_pack("real-flagged", false, true);
+        assert!(pin_unchecked_records_in(&packs) > 0);
+        assert_eq!(check_archive_records_in(&packs, None), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "records mismatched")]
+    fn a_corrupted_comparable_record_fails_the_record_check() {
+        let (_t, packs) = inline_pack("real-bad-records", true, false);
+        check_archive_records_in(&packs, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "pack_dir.vpk")]
+    fn a_corrupted_comparable_record_fails_the_regeneration_check() {
+        let (_t, packs) = inline_pack("real-bad-regen", true, false);
+        regenerated_records_match_in(&packs);
+    }
 }

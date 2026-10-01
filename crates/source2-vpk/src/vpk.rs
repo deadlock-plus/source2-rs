@@ -214,6 +214,10 @@ impl Vpk {
     }
 
     /// Remove and return the first entry with this path.
+    ///
+    /// Exactly one entry is dropped per call. A pack may list the same path more than
+    /// once (a `README.txt` twice, say), so [`Vpk::find`] can still return another copy
+    /// afterwards; call `remove` again until it returns `None` to drop them all.
     pub fn remove(&mut self, path: &str) -> Option<Entry> {
         let at = self.entries.iter().position(|e| e.path == path)?;
         self.index = OnceLock::new();

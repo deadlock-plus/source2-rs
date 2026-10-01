@@ -154,6 +154,9 @@ assert!(edited.find("docs/old.txt").is_none());
 
 Notes:
 
+- `remove` drops exactly one entry per call, the first with that path. A pack may list a
+  path twice (a `README.txt` twice, say), so `find` can still return another copy
+  afterwards. Call `remove` until it returns `None` to drop every copy.
 - `Vpk::add` rejects duplicate paths and bad paths at once. `Vpk::push` checks nothing until
   the document is written.
 - Version 2 archive MD5 records are regenerated when the document holds new in-memory

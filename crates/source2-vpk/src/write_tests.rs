@@ -607,6 +607,23 @@ fn entries_can_be_removed_and_looked_up_afterwards() {
 }
 
 #[test]
+fn remove_drops_one_entry_per_call_and_duplicates_stay_findable() {
+    let mut v = Vpk::new(2);
+    v.push(Entry::new("README.txt", b"first".to_vec()));
+    v.push(Entry::new("README.txt", b"second".to_vec()));
+    assert_eq!(v.len(), 2);
+
+    let first = v.remove("README.txt").unwrap();
+    assert_eq!(first.size(), 5);
+    assert_eq!(v.len(), 1);
+    assert!(v.find("README.txt").is_some());
+
+    assert!(v.remove("README.txt").is_some());
+    assert!(v.find("README.txt").is_none());
+    assert!(v.remove("README.txt").is_none());
+}
+
+#[test]
 fn refresh_crc_follows_edited_bytes() {
     let mut e = Entry::new("a.txt", b"abc".to_vec());
     assert_eq!(e.crc, crc32(b"abc"));
