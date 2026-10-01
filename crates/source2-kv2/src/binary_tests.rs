@@ -10,6 +10,14 @@ const ID_A: &str = "8aa7f40b-f824-4431-aea0-0f5e40cfc8b5";
 const ID_B: &str = "0a5d19f3-6a67-4a23-94d1-7c1474291afe";
 const ID_C: &str = "30f47fdc-47ae-4348-8e12-1f7e724e91fa";
 
+/// Parses and forgets the string table, which hand-built documents do not carry.
+fn parse_plain(bytes: &[u8]) -> Result<Document> {
+    Document::parse(bytes).map(|mut d| {
+        d.string_table.clear();
+        d
+    })
+}
+
 fn uuid(s: &str) -> Uuid {
     Uuid::parse(s).unwrap()
 }
@@ -45,8 +53,8 @@ impl Put for Vec<u8> {
 
 /// Root `Root`/`r` with an int, a string and a reference to `Leaf`/`l`.
 fn sample_doc(version: u32) -> Document {
-    let mut d = Document::new(Encoding::Binary, version, "dmx", 1);
-    let mut root = Element::new("Root", "r", uuid(ID_A));
+    let mut d = Document::with_encoding(Encoding::Binary, version, "dmx", 1);
+    let mut root = Element::from_parts("Root", "r", uuid(ID_A));
     root.attributes.push(Attribute::new("n", Value::Int(7)));
     root.attributes
         .push(Attribute::new("s", Value::String("hi".into())));
@@ -55,13 +63,14 @@ fn sample_doc(version: u32) -> Document {
         Value::Element(ElementRef::Element(ElementId(1))),
     ));
     d.add_element(root);
-    d.add_element(Element::new("Leaf", "l", uuid(ID_B)));
+    d.add_element(Element::from_parts("Leaf", "l", uuid(ID_B)));
     d
 }
 
 fn sample_bytes(version: u32) -> Vec<u8> {
     let mut b = header(version);
     let wide = version >= 5;
+    let wide_count = version >= 4;
     let names_in_table = version >= 4;
     let table: &[&str] = match version {
         1 => &[],
@@ -72,7 +81,7 @@ fn sample_bytes(version: u32) -> Vec<u8> {
         b.i32(0);
     }
     if version >= 2 {
-        if wide {
+        if wide_count {
             b.i32(table.len() as i32);
         } else {
             b.u16(table.len() as u16);
@@ -144,7 +153,7 @@ fn guid_byte_order() {
 #[test]
 fn reads_each_version() {
     for v in ALL {
-        let got = Document::parse(&sample_bytes(v)).unwrap_or_else(|e| panic!("v{v}: {e}"));
+        let got = parse_plain(&sample_bytes(v)).unwrap_or_else(|e| panic!("v{v}: {e}"));
         assert_eq!(got, sample_doc(v), "v{v}");
     }
 }
@@ -161,13 +170,13 @@ fn unsupported_versions_are_reported() {
     for v in [0u32, 6, 7, 8, 10, 11, 4_000_000_000] {
         let mut b = header(v);
         b.i32(0);
-        let e = Document::parse(&b).unwrap_err();
+        let e = parse_plain(&b).unwrap_err();
         assert!(
             matches!(e, Error::UnsupportedVersion { version, .. } if version == v),
             "v{v}: {e:?}"
         );
-        let mut d = Document::new(Encoding::Binary, v, "dmx", 1);
-        d.add_element(Element::new("R", "", uuid(ID_A)));
+        let mut d = Document::with_encoding(Encoding::Binary, v, "dmx", 1);
+        d.add_element(Element::from_parts("R", "", uuid(ID_A)));
         assert!(matches!(
             d.to_bytes(),
             Err(Error::UnsupportedVersion { .. })
@@ -181,7 +190,7 @@ fn header_requires_the_nul() {
 "
     .to_vec();
     no_nul.extend_from_slice(&[1, 0, 0, 0]);
-    assert!(matches!(Document::parse(&no_nul), Err(Error::BadHeader(_))));
+    assert!(matches!(parse_plain(&no_nul), Err(Error::BadHeader(_))));
 }
 
 /// Each case: value, bytes of the type tag and payload in version 5, same in version 9.
@@ -268,8 +277,8 @@ fn type_cases() -> Vec<(Value, Wire, Wire)> {
 }
 
 fn one_attr_doc(version: u32, v: Value) -> Document {
-    let mut d = Document::new(Encoding::Binary, version, "dmx", 1);
-    let mut e = Element::new("E", "", uuid(ID_A));
+    let mut d = Document::with_encoding(Encoding::Binary, version, "dmx", 1);
+    let mut e = Element::from_parts("E", "", uuid(ID_A));
     e.attributes.push(Attribute::new("a", v));
     d.add_element(e);
     d
@@ -288,11 +297,7 @@ fn type_tags_and_payloads() {
                         "v{version} {value:?}: {:02x?} does not end with {tail:02x?}",
                         &bytes[bytes.len().saturating_sub(24)..]
                     );
-                    assert_eq!(
-                        Document::parse(&bytes).unwrap(),
-                        doc,
-                        "v{version} {value:?}"
-                    );
+                    assert_eq!(parse_plain(&bytes).unwrap(), doc, "v{version} {value:?}");
                 }
                 None => assert!(
                     matches!(doc.to_bytes(), Err(Error::InvalidModel(_))),
@@ -322,7 +327,7 @@ fn object_id_exists_before_v3_and_time_from_v3() {
         let mut tail = vec![7];
         tail.extend_from_slice(&uuid(ID_C).to_guid_bytes());
         assert!(bytes.ends_with(&tail));
-        assert_eq!(Document::parse(&bytes).unwrap(), doc);
+        assert_eq!(parse_plain(&bytes).unwrap(), doc);
         assert!(one_attr_doc(v, Value::Time(Time(1))).to_bytes().is_err());
     }
     for v in [3, 4, 5, 9] {
@@ -350,7 +355,7 @@ fn external_reference_round_trips() {
             ),
         ));
         let bytes = d.to_bytes().unwrap();
-        assert_eq!(Document::parse(&bytes).unwrap(), d, "v{v}");
+        assert_eq!(parse_plain(&bytes).unwrap(), d, "v{v}");
     }
 }
 
@@ -370,10 +375,10 @@ fn null_and_external_markers_on_the_wire() {
 }
 
 fn rich_doc(version: u32) -> Document {
-    let mut d = Document::new(Encoding::Binary, version, "vmap", 28);
-    let root = d.add_element(Element::new("CMapRootElement", "", uuid(ID_A)));
-    let leaf = d.add_element(Element::new("Leaf", "leaf name", uuid(ID_B)));
-    let other = d.add_element(Element::new("Leaf", "", uuid(ID_C)));
+    let mut d = Document::with_encoding(Encoding::Binary, version, "vmap", 28);
+    let root = d.add_element(Element::from_parts("CMapRootElement", "", uuid(ID_A)));
+    let leaf = d.add_element(Element::from_parts("Leaf", "leaf name", uuid(ID_B)));
+    let other = d.add_element(Element::from_parts("Leaf", "", uuid(ID_C)));
     let m: [f32; 16] = core::array::from_fn(|i| i as f32 * 0.25);
     let mut vals = vec![
         Value::Element(ElementRef::Element(leaf)),
@@ -432,14 +437,17 @@ fn rich_doc(version: u32) -> Document {
         ),
     ));
     if version == 9 {
-        d.prefix.push(vec![
-            Attribute::new("thumb", Value::Binary(vec![1, 2, 3])),
-            Attribute::new("fmt", Value::String("jpg".into())),
-            Attribute::new(
-                "refs",
-                Value::Array(ValueType::String, vec![Value::String("a.vmat".into())]),
-            ),
-        ]);
+        d.prefix.push(Prefix {
+            id: None,
+            attributes: vec![
+                Attribute::new("thumb", Value::Binary(vec![1, 2, 3])),
+                Attribute::new("fmt", Value::String("jpg".into())),
+                Attribute::new(
+                    "refs",
+                    Value::Array(ValueType::String, vec![Value::String("a.vmat".into())]),
+                ),
+            ],
+        });
     }
     d
 }
@@ -449,7 +457,7 @@ fn every_type_round_trips_in_every_version() {
     for v in ALL {
         let d = rich_doc(v);
         let bytes = d.to_bytes().unwrap_or_else(|e| panic!("v{v}: {e}"));
-        let back = Document::parse(&bytes).unwrap_or_else(|e| panic!("v{v}: {e}"));
+        let back = parse_plain(&bytes).unwrap_or_else(|e| panic!("v{v}: {e}"));
         assert_eq!(back, d, "v{v}");
         assert_eq!(back.to_bytes().unwrap(), bytes, "v{v} second pass");
     }
@@ -457,10 +465,12 @@ fn every_type_round_trips_in_every_version() {
 
 #[test]
 fn v9_prefix_uses_inline_strings_before_the_table() {
-    let mut d = Document::new(Encoding::Binary, 9, "dmx", 1);
-    d.prefix
-        .push(vec![Attribute::new("p", Value::String("q".into()))]);
-    d.add_element(Element::new("R", "", uuid(ID_A)));
+    let mut d = Document::with_encoding(Encoding::Binary, 9, "dmx", 1);
+    d.prefix.push(Prefix {
+        id: None,
+        attributes: vec![Attribute::new("p", Value::String("q".into()))],
+    });
+    d.add_element(Element::from_parts("R", "", uuid(ID_A)));
     let bytes = d.to_bytes().unwrap();
     let mut want = header(9);
     want.i32(1);
@@ -474,8 +484,8 @@ fn v9_prefix_uses_inline_strings_before_the_table() {
 #[test]
 fn empty_document_round_trips() {
     for v in ALL {
-        let d = Document::new(Encoding::Binary, v, "dmx", 1);
-        assert_eq!(Document::parse(&d.to_bytes().unwrap()).unwrap(), d, "v{v}");
+        let d = Document::with_encoding(Encoding::Binary, v, "dmx", 1);
+        assert_eq!(parse_plain(&d.to_bytes().unwrap()).unwrap(), d, "v{v}");
     }
 }
 
@@ -484,12 +494,13 @@ fn text_and_binary_convert_both_ways() {
     let text = format!(
         "<!-- dmx encoding keyvalues2 1 format dmx 1 -->\n\"Root\"\n{{\n\t\"id\" \"elementid\" \"{ID_A}\"\n\t\"name\" \"string\" \"r\"\n\t\"kids\" \"element_array\"\n\t[\n\t\t\"Leaf\"\n\t\t{{\n\t\t\t\"id\" \"elementid\" \"{ID_B}\"\n\t\t\t\"v\" \"vector3\" \"1 2 3\"\n\t\t}},\n\t\t\"element\" \"{ID_B}\"\n\t]\n}}\n"
     );
-    let mut doc = Document::parse(text.as_bytes()).unwrap();
+    let mut doc = parse_plain(text.as_bytes()).unwrap();
     for v in [2u32, 5, 9] {
         doc.encoding = Encoding::Binary;
         doc.encoding_version = v;
         let bin = doc.to_bytes().unwrap();
-        let mut back = Document::parse(&bin).unwrap();
+        let mut back = parse_plain(&bin).unwrap();
+        back.text_style = doc.text_style;
         assert_eq!(back, doc);
         back.encoding = Encoding::KeyValues2;
         back.encoding_version = 1;
@@ -498,7 +509,7 @@ fn text_and_binary_convert_both_ways() {
 }
 
 fn expect_err(bytes: &[u8], what: &str) {
-    let r = Document::parse(bytes);
+    let r = parse_plain(bytes);
     assert!(r.is_err(), "{what}: parsed as {r:?}");
 }
 
@@ -508,7 +519,7 @@ fn truncation_anywhere_is_an_error_not_a_panic() {
         let bytes = rich_doc(v).to_bytes().unwrap();
         let start = header(v).len();
         for cut in start..bytes.len() {
-            let r = Document::parse(&bytes[..cut]);
+            let r = parse_plain(&bytes[..cut]);
             assert!(r.is_err(), "v{v} cut {cut}/{} parsed", bytes.len());
         }
     }
@@ -694,7 +705,7 @@ fn bit_flips_never_panic() {
                 let i = start + (next() as usize) % (b.len() - start);
                 b[i] = next() as u8;
             }
-            let _ = Document::parse(&b);
+            let _ = parse_plain(&b);
         }
     }
 }
@@ -715,21 +726,24 @@ fn text_bit_flips_never_panic() {
         let mut b = good.clone();
         let i = start + (next() as usize) % (b.len() - start);
         b[i] = next() as u8;
-        let _ = Document::parse(&b);
+        let _ = parse_plain(&b);
     }
 }
 
 #[test]
 fn invalid_models_are_rejected_by_the_binary_writer() {
-    let mut d = Document::new(Encoding::Binary, 5, "dmx", 1);
-    d.add_element(Element::new("R", "", uuid(ID_A)));
+    let mut d = Document::with_encoding(Encoding::Binary, 5, "dmx", 1);
+    d.add_element(Element::from_parts("R", "", uuid(ID_A)));
     d.elements[0].attributes.push(Attribute::new(
         "x",
         Value::Element(ElementRef::Element(ElementId(3))),
     ));
     assert!(d.to_bytes().is_err());
-    let mut d = Document::new(Encoding::Binary, 5, "dmx", 1);
-    d.add_element(Element::new("R", "", uuid(ID_A)));
-    d.prefix.push(vec![]);
+    let mut d = Document::with_encoding(Encoding::Binary, 5, "dmx", 1);
+    d.add_element(Element::from_parts("R", "", uuid(ID_A)));
+    d.prefix.push(Prefix {
+        id: None,
+        attributes: vec![],
+    });
     assert!(d.to_bytes().is_err(), "prefix needs version 9");
 }

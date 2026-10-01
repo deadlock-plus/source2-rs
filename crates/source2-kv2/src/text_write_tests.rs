@@ -11,7 +11,7 @@ fn uuid(s: &str) -> Uuid {
 }
 
 fn doc() -> Document {
-    Document::new(Encoding::KeyValues2, 1, "dmx", 1)
+    Document::with_encoding(Encoding::KeyValues2, 1, "dmx", 1)
 }
 
 fn text(d: &Document) -> String {
@@ -26,7 +26,7 @@ fn roundtrip(d: &Document) -> Document {
 #[test]
 fn exact_output_for_a_small_document() {
     let mut d = doc();
-    let mut root = Element::new("DmElement", "root", uuid(ID_A));
+    let mut root = Element::from_parts("DmElement", "root", uuid(ID_A));
     root.attributes.push(Attribute::new("n", Value::Int(3)));
     root.attributes
         .push(Attribute::new("s", Value::String("a\"b".into())));
@@ -47,15 +47,16 @@ fn exact_output_for_a_small_document() {
 \t\"name\" \"string\" \"root\"\n\
 \t\"n\" \"int\" \"3\"\n\
 \t\"s\" \"string\" \"a\\\"b\"\n\
-\t\"ints\" \"int_array\"\n\
+\t\"ints\" \"int_array\" \n\
 \t[\n\
 \t\t\"1\",\n\
 \t\t\"2\"\n\
 \t]\n\
-\t\"none\" \"float_array\"\n\
+\t\"none\" \"float_array\" \n\
 \t[\n\
 \t]\n\
-}}\n"
+}}\n\
+\n"
     );
     assert_eq!(text(&d), want);
 }
@@ -63,15 +64,15 @@ fn exact_output_for_a_small_document() {
 #[test]
 fn unnamed_elements_omit_the_name_attribute() {
     let mut d = doc();
-    d.add_element(Element::new("E", "", uuid(ID_A)));
+    d.add_element(Element::from_parts("E", "", uuid(ID_A)));
     assert!(!text(&d).contains("\"name\""));
 }
 
 #[test]
 fn inline_then_reference_for_shared_elements() {
     let mut d = doc();
-    d.add_element(Element::new("Root", "", uuid(ID_A)));
-    let leaf = d.add_element(Element::new("Leaf", "", uuid(ID_B)));
+    d.add_element(Element::from_parts("Root", "", uuid(ID_A)));
+    let leaf = d.add_element(Element::from_parts("Leaf", "", uuid(ID_B)));
     d.elements[0].attributes.push(Attribute::new(
         "first",
         Value::Element(ElementRef::Element(leaf)),
@@ -92,21 +93,15 @@ fn inline_then_reference_for_shared_elements() {
     assert!(t.contains("\"null\" \"element\" \"\""));
     assert!(t.contains(&format!("\"ext\" \"element\" \"{ID_C}\"")));
     assert_eq!(t.matches("\"Leaf\"").count(), 1);
-    let back = Document::parse_with(
-        t.as_bytes(),
-        &ReadOptions {
-            allow_unresolved: true,
-        },
-    )
-    .unwrap();
+    let back = Document::parse(t.as_bytes()).unwrap();
     assert_eq!(back, d);
 }
 
 #[test]
 fn cycles_are_written_as_references() {
     let mut d = doc();
-    let a = d.add_element(Element::new("A", "a", uuid(ID_A)));
-    let b = d.add_element(Element::new("B", "b", uuid(ID_B)));
+    let a = d.add_element(Element::from_parts("A", "a", uuid(ID_A)));
+    let b = d.add_element(Element::from_parts("B", "b", uuid(ID_B)));
     d.elements[0]
         .attributes
         .push(Attribute::new("b", Value::Element(ElementRef::Element(b))));
@@ -119,8 +114,8 @@ fn cycles_are_written_as_references() {
 #[test]
 fn every_type_round_trips() {
     let mut d = doc();
-    d.add_element(Element::new("Root", "r", uuid(ID_A)));
-    let other = d.add_element(Element::new("Leaf", "l", uuid(ID_B)));
+    d.add_element(Element::from_parts("Root", "r", uuid(ID_A)));
+    let other = d.add_element(Element::from_parts("Leaf", "l", uuid(ID_B)));
     let m: [f32; 16] = core::array::from_fn(|i| i as f32 * 0.5 - 3.0);
     let scalars = vec![
         Value::Element(ElementRef::Element(other)),
@@ -168,7 +163,7 @@ fn every_type_round_trips() {
 #[test]
 fn time_text_is_exact() {
     let mut d = doc();
-    d.add_element(Element::new("E", "", uuid(ID_A)));
+    d.add_element(Element::from_parts("E", "", uuid(ID_A)));
     for (ticks, s) in [
         (15000, "1.5"),
         (1, "0.0001"),
@@ -190,14 +185,17 @@ fn time_text_is_exact() {
 #[test]
 fn prefix_round_trips() {
     let mut d = doc();
-    d.prefix.push(vec![
-        Attribute::new("a", Value::String("x".into())),
-        Attribute::new(
-            "refs",
-            Value::Array(ValueType::String, vec![Value::String("m.vmat".into())]),
-        ),
-    ]);
-    d.add_element(Element::new("Root", "", uuid(ID_A)));
+    d.prefix.push(Prefix {
+        id: None,
+        attributes: vec![
+            Attribute::new("a", Value::String("x".into())),
+            Attribute::new(
+                "refs",
+                Value::Array(ValueType::String, vec![Value::String("m.vmat".into())]),
+            ),
+        ],
+    });
+    d.add_element(Element::from_parts("Root", "", uuid(ID_A)));
     let t = text(&d);
     assert!(t.contains("\"$prefix_element$\""));
     assert_eq!(roundtrip(&d), d);
@@ -233,10 +231,10 @@ fn text_to_model_to_text_is_stable() {
 
 #[test]
 fn noids_output_has_no_ids_and_inlines_everything() {
-    let mut d = Document::new(Encoding::KeyValues2NoIds, 1, "dmx", 1);
+    let mut d = Document::with_encoding(Encoding::KeyValues2NoIds, 1, "dmx", 1);
     let leaf = ElementId(1);
-    d.add_element(Element::new("Root", "r", uuid(ID_A)));
-    d.add_element(Element::new("Leaf", "l", uuid(ID_B)));
+    d.add_element(Element::from_parts("Root", "r", uuid(ID_A)));
+    d.add_element(Element::from_parts("Leaf", "l", uuid(ID_B)));
     d.elements[0].attributes.push(Attribute::new(
         "a",
         Value::Element(ElementRef::Element(leaf)),
@@ -257,8 +255,8 @@ fn noids_output_has_no_ids_and_inlines_everything() {
 
 #[test]
 fn noids_cycle_is_rejected() {
-    let mut d = Document::new(Encoding::KeyValues2NoIds, 1, "dmx", 1);
-    d.add_element(Element::new("Root", "r", uuid(ID_A)));
+    let mut d = Document::with_encoding(Encoding::KeyValues2NoIds, 1, "dmx", 1);
+    d.add_element(Element::from_parts("Root", "r", uuid(ID_A)));
     d.elements[0].attributes.push(Attribute::new(
         "self",
         Value::Element(ElementRef::Element(ElementId(0))),
@@ -271,8 +269,8 @@ fn noids_cycle_is_rejected() {
 
 #[test]
 fn noids_rejects_external_references() {
-    let mut d = Document::new(Encoding::KeyValues2NoIds, 1, "dmx", 1);
-    d.add_element(Element::new("Root", "r", uuid(ID_A)));
+    let mut d = Document::with_encoding(Encoding::KeyValues2NoIds, 1, "dmx", 1);
+    d.add_element(Element::from_parts("Root", "r", uuid(ID_A)));
     d.elements[0].attributes.push(Attribute::new(
         "x",
         Value::Element(ElementRef::External(uuid(ID_B))),
@@ -284,7 +282,7 @@ fn noids_rejects_external_references() {
 fn invalid_models_are_errors() {
     let bad_index = {
         let mut d = doc();
-        d.add_element(Element::new("Root", "", uuid(ID_A)));
+        d.add_element(Element::from_parts("Root", "", uuid(ID_A)));
         d.elements[0].attributes.push(Attribute::new(
             "x",
             Value::Element(ElementRef::Element(ElementId(9))),
@@ -293,7 +291,7 @@ fn invalid_models_are_errors() {
     };
     let mixed_array = {
         let mut d = doc();
-        d.add_element(Element::new("Root", "", uuid(ID_A)));
+        d.add_element(Element::from_parts("Root", "", uuid(ID_A)));
         d.elements[0].attributes.push(Attribute::new(
             "x",
             Value::Array(ValueType::Int, vec![Value::Float(1.0)]),
@@ -302,7 +300,7 @@ fn invalid_models_are_errors() {
     };
     let nested_array = {
         let mut d = doc();
-        d.add_element(Element::new("Root", "", uuid(ID_A)));
+        d.add_element(Element::from_parts("Root", "", uuid(ID_A)));
         d.elements[0].attributes.push(Attribute::new(
             "x",
             Value::Array(ValueType::Int, vec![Value::Array(ValueType::Int, vec![])]),
@@ -316,18 +314,18 @@ fn invalid_models_are_errors() {
     };
     let dup = {
         let mut d = doc();
-        d.add_element(Element::new("A", "", uuid(ID_A)));
-        d.add_element(Element::new("B", "", uuid(ID_A)));
+        d.add_element(Element::from_parts("A", "", uuid(ID_A)));
+        d.add_element(Element::from_parts("B", "", uuid(ID_A)));
         d
     };
     let empty_class = {
         let mut d = doc();
-        d.add_element(Element::new("", "", uuid(ID_A)));
+        d.add_element(Element::from_parts("", "", uuid(ID_A)));
         d
     };
     let empty_attr_name = {
         let mut d = doc();
-        d.add_element(Element::new("A", "", uuid(ID_A)));
+        d.add_element(Element::from_parts("A", "", uuid(ID_A)));
         d.elements[0]
             .attributes
             .push(Attribute::new("", Value::Int(1)));
@@ -353,4 +351,17 @@ fn shipped_file_shape_round_trips() {
     );
     let d = Document::parse(src.as_bytes()).unwrap();
     assert_eq!(roundtrip(&d), d);
+}
+
+#[test]
+fn unreachable_elements_are_written_as_extra_top_level_blocks() {
+    let mut d = doc();
+    d.add_element(Element::from_parts("Root", "", uuid(ID_A)));
+    let mut orphan = Element::from_parts("Orphan", "o", uuid(ID_B));
+    orphan.text.standalone = true;
+    d.add_element(orphan);
+    let t = text(&d);
+    assert!(t.contains("\"Orphan\""), "{t}");
+    let back = roundtrip(&d);
+    assert_eq!(back, d);
 }

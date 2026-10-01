@@ -2,8 +2,8 @@
 
 use crate::value_text::{parse_type, parse_value};
 use crate::{
-    Attribute, Document, Element, ElementId, ElementRef, Encoding, Error, ReadOptions, Result,
-    Uuid, Value, ValueType,
+    Attribute, Document, Element, ElementId, ElementRef, Encoding, Error, Prefix, Result, Uuid,
+    Value, ValueType,
 };
 use std::collections::HashMap;
 
@@ -155,7 +155,16 @@ struct Parser<'a> {
 struct Body {
     id: Option<Uuid>,
     name: Option<String>,
+    /// Lines of the body read before `id` and before `name`.
+    id_position: usize,
+    name_position: Option<usize>,
     attrs: Vec<Attribute>,
+}
+
+impl Body {
+    fn entries(&self) -> usize {
+        self.attrs.len() + usize::from(self.id.is_some()) + usize::from(self.name.is_some())
+    }
 }
 
 impl Parser<'_> {
@@ -223,6 +232,9 @@ impl Parser<'_> {
                     self.expect(&Tok::LBrace)?;
                     if class == PREFIX_CLASS {
                         let body = self.body(0)?;
+                        if body.name.is_some() {
+                            return Err(self.syntax(self.lex.line, "prefix elements have no name"));
+                        }
                         if body.attrs.iter().any(|a| match &a.value {
                             Value::Element(_) => true,
                             Value::Array(t, _) => *t == ValueType::Element,
@@ -232,9 +244,15 @@ impl Parser<'_> {
                                 self.syntax(self.lex.line, "prefix elements hold no elements")
                             );
                         }
-                        self.doc.prefix.push(body.attrs);
+                        self.doc.prefix.push(Prefix {
+                            id: body.id,
+                            attributes: body.attrs,
+                        });
                     } else {
-                        self.element(class, 0)?;
+                        let idx = self.element(class, 0)?;
+                        // The first block is always written top-level, so the flag would only
+                        // make parsed and hand-built roots differ.
+                        self.doc.elements[idx.0 as usize].text.standalone = idx.0 != 0;
                     }
                 }
                 (tok, line) => {
@@ -253,7 +271,9 @@ impl Parser<'_> {
         if depth > MAX_DEPTH {
             return Err(Error::TooDeep);
         }
-        let idx = self.doc.add_element(Element::new(class, "", Uuid::NIL));
+        let idx = self
+            .doc
+            .add_element(Element::from_parts(class, "", Uuid::NIL));
         let body = self.body(depth)?;
         let id = match body.id {
             Some(id) => id,
@@ -273,6 +293,11 @@ impl Parser<'_> {
         e.id = id;
         e.name = body.name.unwrap_or_default();
         e.attributes = body.attrs;
+        e.text.id_position = body.id_position;
+        let default_name_position = body.id_position + usize::from(body.id.is_some());
+        e.text.name_position = body
+            .name_position
+            .filter(|&p| p != default_name_position || e.name.is_empty());
         Ok(idx)
     }
 
@@ -280,6 +305,8 @@ impl Parser<'_> {
         let mut body = Body {
             id: None,
             name: None,
+            id_position: 0,
+            name_position: None,
             attrs: Vec::new(),
         };
         loop {
@@ -297,8 +324,15 @@ impl Parser<'_> {
                 }
             };
             let (ty, ty_line) = self.string()?;
-            if key == "id" && ty == "elementid" {
+            if key == "id" {
+                if ty != "elementid" || body.id.is_some() {
+                    return Err(self.syntax(
+                        ty_line,
+                        "`id` is reserved: it must appear once, typed `elementid`",
+                    ));
+                }
                 let (s, line) = self.string()?;
+                body.id_position = body.entries();
                 body.id = Some(
                     Uuid::parse(&s)
                         .ok_or_else(|| self.syntax(line, format!("`{s}` is not an id")))?,
@@ -320,9 +354,21 @@ impl Parser<'_> {
                     Value::Element(ElementRef::Element(id))
                 }
             };
-            match value {
-                Value::String(s) if key == "name" && body.name.is_none() => body.name = Some(s),
-                value => body.attrs.push(Attribute::new(key, value)),
+            if key == "name" {
+                match value {
+                    Value::String(s) if body.name.is_none() => {
+                        body.name_position = Some(body.entries());
+                        body.name = Some(s);
+                    }
+                    _ => {
+                        return Err(self.syntax(
+                            ty_line,
+                            "`name` is reserved: it must appear once, typed `string`",
+                        ));
+                    }
+                }
+            } else {
+                body.attrs.push(Attribute::new(key, value));
             }
         }
     }
@@ -362,37 +408,30 @@ impl Parser<'_> {
         }
     }
 
-    fn resolve(&mut self, allow_unresolved: bool) -> Result<()> {
+    /// Points references at the elements their ids name. Ids no element has stay
+    /// [`ElementRef::External`].
+    fn resolve(&mut self) {
         let ids = &self.ids;
-        let fix = |v: &mut Value| -> Result<()> {
+        let fix = |v: &mut Value| {
             if let Value::Element(r) = v
                 && let ElementRef::External(u) = *r
+                && let Some(&id) = ids.get(&u)
             {
-                match ids.get(&u) {
-                    Some(&id) => *r = ElementRef::Element(id),
-                    None if allow_unresolved => {}
-                    None => return Err(Error::UnresolvedReference(u)),
-                }
+                *r = ElementRef::Element(id);
             }
-            Ok(())
         };
         for e in &mut self.doc.elements {
             for a in &mut e.attributes {
                 match &mut a.value {
-                    Value::Array(ValueType::Element, items) => {
-                        for item in items {
-                            fix(item)?;
-                        }
-                    }
-                    v => fix(v)?,
+                    Value::Array(ValueType::Element, items) => items.iter_mut().for_each(fix),
+                    v => fix(v),
                 }
             }
         }
-        Ok(())
     }
 }
 
-pub(crate) fn parse(doc: Document, body: &[u8], opts: &ReadOptions) -> Result<Document> {
+pub(crate) fn parse(doc: Document, body: &[u8]) -> Result<Document> {
     let noids = doc.encoding == Encoding::KeyValues2NoIds;
     let mut p = Parser {
         lex: Lexer {
@@ -407,6 +446,6 @@ pub(crate) fn parse(doc: Document, body: &[u8], opts: &ReadOptions) -> Result<Do
         generated: 0,
     };
     p.document()?;
-    p.resolve(opts.allow_unresolved)?;
+    p.resolve();
     Ok(p.doc)
 }

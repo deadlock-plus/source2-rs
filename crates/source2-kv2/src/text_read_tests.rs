@@ -51,7 +51,6 @@ fn header_rejects_garbage() {
         "hello\n\"Root\"\n{\n}\n",
         "<!-- dmx encoding keyvalues2 1 format dmx -->\n",
         "<!-- dmx encoding keyvalues2 x format dmx 1 -->\n",
-        "<!-- dmx encoding keyvalues2 1 format dmx 1 -->",
         "<!-- dmx encoding keyvalues2 1 fromat dmx 1 -->\n",
         "<!-- dmx encoding keyvalues2 1 format dmx 1 extra -->\n",
     ] {
@@ -371,33 +370,11 @@ fn element_arrays_mix_inline_and_references() {
 }
 
 #[test]
-fn unresolved_reference_is_an_error_by_default() {
-    let r = parse(&format!(
-        "\"Root\"\n{{\n\t\"id\" \"elementid\" \"{ID_A}\"\n\t\"r\" \"element\" \"{ID_B}\"\n}}\n"
-    ));
-    assert!(matches!(r, Err(Error::UnresolvedReference(u)) if u == uuid(ID_B)));
-}
-
-#[test]
-fn unresolved_reference_in_array_is_an_error() {
-    let r = parse(&format!(
-        "\"Root\"\n{{\n\t\"id\" \"elementid\" \"{ID_A}\"\n\t\"r\" \"element_array\" [ \"element\" \"{ID_B}\" ]\n}}\n"
-    ));
-    assert!(matches!(r, Err(Error::UnresolvedReference(_))));
-}
-
-#[test]
-fn unresolved_reference_can_be_kept() {
+fn dangling_reference_stays_external() {
     let text = format!(
         "{HDR}\"Root\"\n{{\n\t\"id\" \"elementid\" \"{ID_A}\"\n\t\"r\" \"element\" \"{ID_B}\"\n}}\n"
     );
-    let doc = Document::parse_with(
-        text.as_bytes(),
-        &ReadOptions {
-            allow_unresolved: true,
-        },
-    )
-    .unwrap();
+    let doc = Document::parse(text.as_bytes()).unwrap();
     assert_eq!(
         attr(&doc, 0, "r"),
         &Value::Element(ElementRef::External(uuid(ID_B)))
@@ -451,8 +428,8 @@ fn prefix_elements_come_before_the_root() {
 "#
     ));
     assert_eq!(doc.prefix.len(), 1);
-    assert_eq!(doc.prefix[0].len(), 2);
-    assert_eq!(doc.prefix[0][0].name, "thumb");
+    assert_eq!(doc.prefix[0].attributes.len(), 2);
+    assert_eq!(doc.prefix[0].attributes[0].name, "thumb");
     assert_eq!(doc.elements.len(), 1);
     assert_eq!(doc.root().unwrap().class, "Root");
 }
@@ -615,4 +592,34 @@ fn real_world_shape_from_a_shipped_file() {
     let doc = Document::parse(text.as_bytes()).unwrap();
     assert_eq!(doc.elements.len(), 3);
     assert_eq!(doc.elements[2].class, "RoundStats_t");
+}
+
+#[test]
+fn named_check_rejects_a_dangling_reference() {
+    let doc = parse_ok(&format!(
+        "\"Root\"\n{{\n\t\"id\" \"elementid\" \"{ID_A}\"\n\t\"r\" \"element\" \"{ID_B}\"\n}}\n"
+    ));
+    assert!(matches!(
+        doc.check_references(),
+        Err(Error::UnresolvedReference(u)) if u == uuid(ID_B)
+    ));
+}
+
+#[test]
+fn named_check_rejects_a_dangling_reference_in_an_array() {
+    let doc = parse_ok(&format!(
+        "\"Root\"\n{{\n\t\"id\" \"elementid\" \"{ID_A}\"\n\t\"r\" \"element_array\" [ \"element\" \"{ID_B}\" ]\n}}\n"
+    ));
+    assert!(matches!(
+        doc.check_references(),
+        Err(Error::UnresolvedReference(_))
+    ));
+}
+
+#[test]
+fn named_check_accepts_resolved_references() {
+    let doc = parse_ok(&format!(
+        "\"Root\"\n{{\n\t\"id\" \"elementid\" \"{ID_A}\"\n\t\"r\" \"element\" \"{ID_A}\"\n}}\n"
+    ));
+    doc.check_references().unwrap();
 }

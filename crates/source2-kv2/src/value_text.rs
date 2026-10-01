@@ -1,6 +1,6 @@
 //! Text spellings of types and values.
 
-use crate::{Color, ElementRef, Time, Uuid, Value, ValueType};
+use crate::{Color, ElementRef, FloatFormat, Time, Uuid, Value, ValueType};
 use std::fmt::Write;
 
 const ARRAY_SUFFIX: &str = "_array";
@@ -61,12 +61,32 @@ pub(crate) fn array_type_name(t: ValueType) -> String {
     format!("{}{ARRAY_SUFFIX}", type_name(t))
 }
 
+/// Parses a float. Rust's own spellings (`inf`, `-inf`, `NaN`, `-0`) work as they are;
+/// the Windows C runtime's `1.#INF`, `-1.#IND` and `1.#QNAN` families are accepted too.
+fn parse_f32(w: &str) -> Option<f32> {
+    if let Ok(x) = w.parse() {
+        return Some(x);
+    }
+    let lower = w.to_ascii_lowercase();
+    let (neg, rest) = match lower.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, lower.strip_prefix('+').unwrap_or(&lower)),
+    };
+    let word = rest.strip_prefix("1.#")?.trim_end_matches('0');
+    let x = match word {
+        "inf" => f32::INFINITY,
+        "ind" | "qnan" | "snan" | "nan" => f32::NAN,
+        _ => return None,
+    };
+    Some(if neg { -x } else { x })
+}
+
 fn floats<const N: usize>(s: &str) -> Result<[f32; N], String> {
     let mut out = [0f32; N];
     let mut it = s.split_ascii_whitespace();
     for slot in &mut out {
         let w = it.next().ok_or_else(|| format!("expected {N} numbers"))?;
-        *slot = w.parse().map_err(|_| format!("`{w}` is not a number"))?;
+        *slot = parse_f32(w).ok_or_else(|| format!("`{w}` is not a number"))?;
     }
     if it.next().is_some() {
         return Err(format!("expected {N} numbers"));
@@ -110,7 +130,7 @@ pub(crate) fn parse_value(t: ValueType, s: &str) -> Result<Value, String> {
             }
         }
         ValueType::Int => Value::Int(s.trim().parse().map_err(|_| bad("an int"))?),
-        ValueType::Float => Value::Float(s.trim().parse().map_err(|_| bad("a float"))?),
+        ValueType::Float => Value::Float(parse_f32(s.trim()).ok_or_else(|| bad("a float"))?),
         ValueType::Bool => match s.trim() {
             "0" | "false" => Value::Bool(false),
             "1" | "true" => Value::Bool(true),
@@ -160,12 +180,27 @@ pub(crate) fn parse_value(t: ValueType, s: &str) -> Result<Value, String> {
     })
 }
 
-fn join(out: &mut String, f: &[f32], sep: char) {
+fn float(out: &mut String, x: f32, fmt: FloatFormat) {
+    match fmt {
+        FloatFormat::Shortest => {
+            let _ = write!(out, "{x}");
+        }
+        FloatFormat::Fixed10 if !x.is_finite() => {
+            let _ = write!(out, "{x}");
+        }
+        FloatFormat::Fixed10 => {
+            let s = format!("{x:.10}");
+            out.push_str(s.trim_end_matches('0').trim_end_matches('.'));
+        }
+    }
+}
+
+fn join(out: &mut String, f: &[f32], fmt: FloatFormat) {
     for (i, x) in f.iter().enumerate() {
         if i > 0 {
-            out.push(sep);
+            out.push(' ');
         }
-        let _ = write!(out, "{x}");
+        float(out, *x, fmt);
     }
 }
 
@@ -202,7 +237,7 @@ pub(crate) fn escape(out: &mut String, s: &str) {
 }
 
 /// Writes one scalar as it appears between quotes. Element values are the caller's job.
-pub(crate) fn format_value(out: &mut String, v: &Value) {
+pub(crate) fn format_value(out: &mut String, v: &Value, fmt: FloatFormat) {
     match v {
         Value::Element(ElementRef::External(u)) | Value::ObjectId(u) => {
             let _ = write!(out, "{u}");
@@ -211,9 +246,7 @@ pub(crate) fn format_value(out: &mut String, v: &Value) {
         Value::Int(i) => {
             let _ = write!(out, "{i}");
         }
-        Value::Float(x) => {
-            let _ = write!(out, "{x}");
-        }
+        Value::Float(x) => float(out, *x, fmt),
         Value::Bool(b) => out.push(if *b { '1' } else { '0' }),
         Value::String(s) => escape(out, s),
         Value::Binary(b) => {
@@ -225,15 +258,15 @@ pub(crate) fn format_value(out: &mut String, v: &Value) {
         Value::Color(c) => {
             let _ = write!(out, "{} {} {} {}", c.r, c.g, c.b, c.a);
         }
-        Value::Vector2(f) => join(out, f, ' '),
-        Value::Vector3(f) | Value::QAngle(f) => join(out, f, ' '),
-        Value::Vector4(f) | Value::Quaternion(f) => join(out, f, ' '),
+        Value::Vector2(f) => join(out, f, fmt),
+        Value::Vector3(f) | Value::QAngle(f) => join(out, f, fmt),
+        Value::Vector4(f) | Value::Quaternion(f) => join(out, f, fmt),
         Value::Matrix(m) => {
             for (i, row) in m.chunks(4).enumerate() {
                 if i > 0 {
                     out.push('\n');
                 }
-                join(out, row, ' ');
+                join(out, row, fmt);
             }
         }
         Value::UInt64(n) => {

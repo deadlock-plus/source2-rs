@@ -8,14 +8,15 @@
 //! - 3 and up: type 7 is a time, not an object id.
 //! - 4 and up: element names and scalar string values are table indices too. String
 //!   arrays stay inline.
-//! - 5 and up: the table count and every index are 4 bytes instead of 2.
+//! - 4: the table count is 4 bytes; indices stay 2 bytes.
+//! - 5 and up: every index is 4 bytes as well.
 //! - 9: Source 2. Prefix elements come first, written with inline strings because the
 //!   table is not read yet. Adds `uint64` and `uint8`, and array types are offset by 32
 //!   instead of 14.
 
 use crate::{
-    Attribute, Color, Document, Element, ElementId, ElementRef, Error, Result, Time, Uuid, Value,
-    ValueType,
+    Attribute, Color, Document, Element, ElementId, ElementRef, Error, Prefix, Result, Time, Uuid,
+    Value, ValueType,
 };
 use std::collections::HashSet;
 
@@ -35,6 +36,10 @@ impl Layout {
 
     pub fn wide(self) -> bool {
         self.version >= 5
+    }
+
+    pub fn wide_count(self) -> bool {
+        self.version >= 4
     }
 
     pub fn names_in_table(self) -> bool {
@@ -367,13 +372,16 @@ pub(crate) fn parse(mut doc: Document, body: &[u8]) -> Result<Document> {
         };
         let n = r.count(4)?;
         for _ in 0..n {
-            doc.prefix.push(prefix.attributes(&mut r)?);
+            doc.prefix.push(Prefix {
+                id: None,
+                attributes: prefix.attributes(&mut r)?,
+            });
         }
     }
 
     let mut table = Vec::new();
     if l.table() {
-        let n = if l.wide() {
+        let n = if l.wide_count() {
             r.count(1)?
         } else {
             let n = usize::from(r.u16()?);
@@ -387,6 +395,7 @@ pub(crate) fn parse(mut doc: Document, body: &[u8]) -> Result<Document> {
             table.push(r.cstr()?);
         }
     }
+    doc.string_table.clone_from(&table);
 
     let ctx = Ctx {
         l,
@@ -414,7 +423,7 @@ pub(crate) fn parse(mut doc: Document, body: &[u8]) -> Result<Document> {
         if !ids.insert(id) {
             return Err(Error::DuplicateId(id));
         }
-        doc.elements.push(Element::new(class, name, id));
+        doc.elements.push(Element::from_parts(class, name, id));
     }
     for i in 0..count {
         doc.elements[i].attributes = ctx.attributes(&mut r)?;

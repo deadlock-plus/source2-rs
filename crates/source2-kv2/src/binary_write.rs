@@ -34,6 +34,16 @@ struct Table {
 }
 
 impl Table {
+    /// Starts from the strings a document already carries, keeping their order.
+    fn seeded(strings: &[String]) -> Self {
+        let mut t = Table::default();
+        t.list.extend_from_slice(strings);
+        for (i, s) in strings.iter().enumerate() {
+            t.index.entry(s.clone()).or_insert(i);
+        }
+        t
+    }
+
     fn intern(&mut self, s: &str) -> usize {
         if let Some(&i) = self.index.get(s) {
             return i;
@@ -170,13 +180,13 @@ pub(crate) fn write(doc: &Document, out: &mut Vec<u8>) -> Result<()> {
     }
     let mut w = Writer {
         l,
-        table: Table::default(),
+        table: Table::seeded(&doc.string_table),
     };
 
     if l.source2() {
         put_i32(out, doc.prefix.len())?;
         for p in &doc.prefix {
-            w.attributes(out, p, false)?;
+            w.attributes(out, &p.attributes, false)?;
         }
     }
 
@@ -192,7 +202,7 @@ pub(crate) fn write(doc: &Document, out: &mut Vec<u8>) -> Result<()> {
     }
 
     if l.table() {
-        if l.wide() {
+        if l.wide_count() {
             put_i32(out, w.table.list.len())?;
         } else {
             let Ok(n) = u16::try_from(w.table.list.len()) else {

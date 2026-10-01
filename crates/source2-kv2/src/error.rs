@@ -5,12 +5,14 @@ use std::path::PathBuf;
 
 /// What went wrong reading or writing a document.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The first line is not a `<!-- dmx encoding ... -->` header.
     BadHeader(String),
     /// The header names an encoding this crate does not handle.
     UnsupportedEncoding(String),
-    /// The encoding is known but this version of it is not.
+    /// The encoding is known but this version of it is not. Binary versions 6, 7 and 8
+    /// exist but their layout is undocumented; above 9 nothing is known.
     UnsupportedVersion {
         /// Encoding name from the header.
         encoding: String,
@@ -26,7 +28,8 @@ pub enum Error {
     },
     /// The binary body ended early, or a count, index or type was out of range.
     Malformed(String),
-    /// An element reference names an id that no element in the document has.
+    /// An element reference names an id that no element in the document has. Only
+    /// [`crate::Document::check_references`] reports this; parsing keeps the reference.
     UnresolvedReference(Uuid),
     /// Two elements share one id.
     DuplicateId(Uuid),
@@ -49,7 +52,11 @@ impl std::fmt::Display for Error {
             Error::BadHeader(m) => write!(f, "bad DMX header: {m}"),
             Error::UnsupportedEncoding(e) => write!(f, "unsupported DMX encoding `{e}`"),
             Error::UnsupportedVersion { encoding, version } => {
-                write!(f, "unsupported {encoding} version {version}")
+                write!(f, "unsupported {encoding} version {version}")?;
+                if encoding == "binary" && (6..=8).contains(version) {
+                    write!(f, " (its layout is not publicly documented)")?;
+                }
+                Ok(())
             }
             Error::Syntax { line, message } => write!(f, "line {line}: {message}"),
             Error::Malformed(m) => write!(f, "malformed DMX binary: {m}"),

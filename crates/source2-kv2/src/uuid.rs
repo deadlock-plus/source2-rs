@@ -1,7 +1,11 @@
 //! Element ids.
 
+use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::hash::{BuildHasher, Hasher};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A 128-bit element id.
 ///
@@ -14,6 +18,39 @@ pub struct Uuid(pub [u8; 16]);
 impl Uuid {
     /// The all-zero id.
     pub const NIL: Uuid = Uuid([0; 16]);
+
+    /// Builds an id from a number, most significant digit first like the text form.
+    pub const fn from_u128(n: u128) -> Self {
+        Uuid(n.to_be_bytes())
+    }
+
+    /// The id as a number, the inverse of [`Uuid::from_u128`].
+    pub const fn as_u128(self) -> u128 {
+        u128::from_be_bytes(self.0)
+    }
+
+    /// A fresh version 4 id, using only the standard library.
+    ///
+    /// Bits come from the process's randomly keyed hasher, the clock and a counter. Ids
+    /// do not collide in practice; do not rely on them being unpredictable.
+    pub fn generate() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut out = [0u8; 16];
+        for (half, chunk) in out.chunks_mut(8).enumerate() {
+            let mut h = RandomState::new().build_hasher();
+            h.write_u64(n);
+            h.write_u128(now);
+            h.write_usize(half);
+            chunk.copy_from_slice(&h.finish().to_be_bytes());
+        }
+        out[6] = out[6] & 0x0f | 0x40;
+        out[8] = out[8] & 0x3f | 0x80;
+        Uuid(out)
+    }
 
     /// Builds an id from the 16 bytes a binary document stores.
     pub fn from_guid_bytes(b: [u8; 16]) -> Self {

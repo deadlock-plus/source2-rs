@@ -1,5 +1,6 @@
 //! Checks shared by the writers.
 
+use crate::value_text::parse_type;
 use crate::{Attribute, Document, ElementRef, Encoding, Error, Result, Value};
 use std::collections::HashSet;
 
@@ -12,24 +13,37 @@ pub(crate) fn validate(doc: &Document) -> Result<()> {
             }
         }
     }
+    let text = doc.encoding != Encoding::Binary;
     for e in &doc.elements {
         if e.class.is_empty() {
             return Err(Error::InvalidModel(
                 "element with an empty class name".into(),
             ));
         }
-        attributes(doc, &e.attributes, true)?;
+        if text && parse_type(&e.class).is_some() {
+            return Err(Error::InvalidModel(format!(
+                "class name `{}` is a type word, which text would read as an attribute",
+                e.class
+            )));
+        }
+        attributes(doc, &e.attributes, true, text)?;
     }
     for p in &doc.prefix {
-        attributes(doc, p, false)?;
+        attributes(doc, &p.attributes, false, text)?;
     }
     Ok(())
 }
 
-fn attributes(doc: &Document, attrs: &[Attribute], elements_ok: bool) -> Result<()> {
+fn attributes(doc: &Document, attrs: &[Attribute], elements_ok: bool, text: bool) -> Result<()> {
     for a in attrs {
         if a.name.is_empty() {
             return Err(Error::InvalidModel("attribute with an empty name".into()));
+        }
+        if text && (a.name == "id" || a.name == "name") {
+            return Err(Error::InvalidModel(format!(
+                "attribute `{}` collides with the element's own `{}` in text",
+                a.name, a.name
+            )));
         }
         match &a.value {
             Value::Array(ty, items) => {
