@@ -325,6 +325,9 @@ pub(crate) fn write(doc: &Document, out: &mut Vec<u8>) -> Result<()> {
     while let Some(i) = w.defined.iter().position(|d| !d) {
         w.top_level(i)?;
     }
+    if !doc.text_style.final_newline && w.out.ends_with(w.nl) {
+        w.out.truncate(w.out.len() - w.nl.len());
+    }
     out.extend_from_slice(w.out.as_bytes());
     Ok(())
 }

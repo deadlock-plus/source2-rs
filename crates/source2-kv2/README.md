@@ -156,7 +156,7 @@ assert!(matches!(err, Error::BadHeader(_)));
 | Field | Holds |
 | --- | --- |
 | `Document::string_table` | binary string table order; unused entries stay; new strings are appended |
-| `Document::text_style` | line ending, blank lines, array spelling, float spelling |
+| `Document::text_style` | line ending, blank lines, array spelling, float spelling, trailing newline |
 | `Element::text` | position of `id` and `name` among the attributes; top-level vs nested |
 | `Prefix::id` | prefix element id (text only) |
 

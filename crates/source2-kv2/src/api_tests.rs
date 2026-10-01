@@ -305,6 +305,26 @@ fn crlf_and_blank_line_habits_round_trip() {
 }
 
 #[test]
+fn missing_final_newline_round_trips() {
+    for nl in ["\n", "\r\n"] {
+        let src = format!(
+            "<!-- dmx encoding keyvalues2_noids 1 format vtex 1 -->{nl}\"R\"{nl}{{{nl}\t\"b\" \"bool\" \"0\"{nl}}}"
+        );
+        let doc = Document::parse(src.as_bytes()).unwrap();
+        assert!(!doc.text_style.final_newline);
+        assert_eq!(rewrite(&src), src);
+        let with = format!("{src}{nl}");
+        assert!(
+            Document::parse(with.as_bytes())
+                .unwrap()
+                .text_style
+                .final_newline
+        );
+        assert_eq!(rewrite(&with), with);
+    }
+}
+
+#[test]
 fn compact_style_round_trips() {
     let src = text_doc(&format!(
         "\"R\"\n{{\n\t\"id\" \"elementid\" \"{ID_A}\"\n\t\"c\" \"C\"\n\t{{\n\t\t\"id\" \"elementid\" \"{ID_B}\"\n\t}}\n\t\"l\" \"int_array\" [ \"1\", \"2\" ]\n\t\"e\" \"element_array\" [ ]\n}}\n"

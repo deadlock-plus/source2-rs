@@ -21,7 +21,11 @@ pub(crate) fn detect(body: &[u8], newline: Newline) -> TextStyle {
         ..TextStyle::default()
     };
     let mut lines: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
-    lines.pop();
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    } else if !body.is_empty() {
+        style.final_newline = false;
+    }
     let lines: Vec<&[u8]> = lines
         .into_iter()
         .map(|l| l.strip_suffix(b"\r").unwrap_or(l))

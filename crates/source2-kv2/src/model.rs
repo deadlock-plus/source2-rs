@@ -512,6 +512,8 @@ pub struct TextStyle {
     pub space_after_comma: bool,
     /// How floats are spelled.
     pub float_format: FloatFormat,
+    /// The last line ends with a line break. Some files stop right after the closing brace.
+    pub final_newline: bool,
 }
 
 impl Default for TextStyle {
@@ -524,6 +526,7 @@ impl Default for TextStyle {
             inline_arrays: false,
             space_after_comma: false,
             float_format: FloatFormat::Shortest,
+            final_newline: true,
         }
     }
 }
