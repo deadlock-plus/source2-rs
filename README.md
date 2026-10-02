@@ -47,4 +47,4 @@ cargo test -p source2-kv3 --no-default-features --features zstd
 
 ## Licence
 
-GPL-3.0-or-later. See [LICENSE.md](LICENSE.md).
+Licensed under either of Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE)) or the MIT license ([`LICENSE-MIT`](LICENSE-MIT)) at your option. The kv3 binary reader is ported from ValveResourceFormat (MIT); see [`THIRD-PARTY.md`](THIRD-PARTY.md).

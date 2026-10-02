@@ -6,9 +6,9 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-license = "GPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/deadlock-plus/source2-rs"
-authors = ["Deftu"]
+authors = ["deadlock-plus contributors"]
 
 [workspace.dependencies]
 source2-kv1 = { version = "0.1.0", path = "crates/source2-kv1" }
