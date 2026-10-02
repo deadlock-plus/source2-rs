@@ -15,6 +15,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a252f5e20f038fe7b4ea53e073e65398d652c864cc162fc77c56c2f13717b888"
 
 [[package]]
+name = "source2"
+version = "0.1.0"
+dependencies = [
+ "source2-kv1",
+ "source2-kv2",
+ "source2-kv3",
+ "source2-resource",
+ "source2-vpk",
+]
+
+[[package]]
 name = "source2-kv1"
 version = "0.1.0"
 

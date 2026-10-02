@@ -1,0 +1,36 @@
+[package]
+name = "source2"
+description = "One dependency for the Source 2 file formats: VPK, compiled resources, KeyValues 1, KeyValues 2 (DMX) and KeyValues 3"
+keywords = ["source2", "valve", "vpk", "keyvalues", "kv3"]
+categories = ["game-development", "parser-implementations", "encoding"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[dependencies]
+source2-vpk = { workspace = true, optional = true }
+source2-resource = { workspace = true, optional = true }
+source2-kv1 = { workspace = true, optional = true }
+source2-kv2 = { workspace = true, optional = true }
+source2-kv3 = { workspace = true, optional = true }
+
+[features]
+default = ["vpk", "resource", "kv1", "kv2", "kv3", "lz4", "zstd"]
+vpk = ["dep:source2-vpk"]
+resource = ["dep:source2-resource"]
+kv1 = ["dep:source2-kv1"]
+kv2 = ["dep:source2-kv2"]
+kv3 = ["dep:source2-kv3"]
+lz4 = ["kv3", "source2-kv3/lz4"]
+zstd = ["kv3", "source2-kv3/zstd"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

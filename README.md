@@ -9,13 +9,14 @@ parse a file, change it, write it back, and nothing the format stores is lost.
 
 | Crate | Format |
 | --- | --- |
+| `source2` | Facade: re-exports all five behind features |
 | `source2-vpk` | Valve Pak (VPK) archives |
 | `source2-resource` | Compiled-resource containers (`*_c`) |
 | `source2-kv1` | KeyValues 1, text and binary |
 | `source2-kv2` | KeyValues 2 / DMX, text and binary |
 | `source2-kv3` | KeyValues 3, text and binary |
 
-The crates are independent of each other. Each crate's README lists the versions it supports and
+The format crates are independent of each other; `source2` re-exports them behind features. Each crate's README lists the versions it supports and
 what has and has not been checked against real files.
 
 `source2-kv3` has two features, both on by default:
