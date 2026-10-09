@@ -13,6 +13,7 @@
 //! | Trait | On | Needs | Methods |
 //! |---|---|---|---|
 //! | `ResourceKv3` | `Resource` | `resource`, `kv3` | `read_kv3`, `put_kv3` |
+//! | `ResourceTexture` | `Resource` | `resource`, `kv3`, `texture` | `texture_is_ycocg`, `decode_texture_rgba8` |
 //! | `VpkResource` | `Vpk` | `vpk`, `resource` | `read_resource`, `put_resource` |
 //! | `VpkKv1` | `Vpk` | `vpk`, `kv1` | `read_kv1_text`, `read_kv1_binary`, `put_kv1_text`, `put_kv1_binary` |
 //! | `VpkKv2` | `Vpk` | `vpk`, `kv2` | `read_kv2`, `put_kv2` |
@@ -529,6 +530,91 @@ mod vpk_resource_kv3 {
             let mut resource = self.read_resource(path)?;
             resource.put_kv3(kind, doc)?;
             self.put_resource(path, &resource)
+        }
+    }
+}
+
+#[cfg(all(feature = "resource", feature = "kv3", feature = "texture"))]
+pub use resource_texture::ResourceTexture;
+
+#[cfg(all(feature = "resource", feature = "kv3", feature = "texture"))]
+mod resource_texture {
+    use source2_resource::{BlockKind, Resource};
+    use source2_texture::{Image, Texture};
+
+    use super::ResourceKv3;
+    use super::sealed::Sealed;
+    use crate::{Error, Result};
+
+    const YCOCG_MARKER: &str = "Texture Compiler Version Image YCoCg Conversion";
+
+    /// Decoding a `vtex_c` resource, with the `YCoCg` conversion applied when the resource asks
+    /// for it.
+    ///
+    /// Some BC3 textures hold scaled `YCoCg` instead of RGB (see
+    /// [`Image::ycocg_to_rgb`]). The texture compiler records this in the `RED2` block: the
+    /// `m_SpecialDependencies` list has an entry whose `m_String` is
+    /// `"Texture Compiler Version Image YCoCg Conversion"`. This trait reads that marker and
+    /// never looks at the pixels.
+    ///
+    /// ```no_run
+    /// use source2::ext::ResourceTexture;
+    /// use source2::resource::Resource;
+    ///
+    /// let resource = Resource::parse(&std::fs::read("icon_psd.vtex_c")?)?;
+    /// let image = resource.decode_texture_rgba8(0)?;
+    /// println!("{}x{}", image.width, image.height);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub trait ResourceTexture: Sealed {
+        /// Whether the `RED2` block marks the texture as scaled `YCoCg`.
+        ///
+        /// A resource with no `RED2` block is not marked.
+        ///
+        /// # Errors
+        ///
+        /// [`Error::UnrecognisedFormat`] or [`Error::Kv3`] when the `RED2` block is not
+        /// readable KV3.
+        fn texture_is_ycocg(&self) -> Result<bool>;
+
+        /// Decode mip `level` to RGBA8, converting from `YCoCg` when
+        /// [`texture_is_ycocg`](ResourceTexture::texture_is_ycocg) is true.
+        ///
+        /// # Errors
+        ///
+        /// [`Error::BlockNotFound`] without a `DATA` block, [`Error::Texture`] when the
+        /// texture does not parse or decode, and the errors of
+        /// [`texture_is_ycocg`](ResourceTexture::texture_is_ycocg).
+        fn decode_texture_rgba8(&self, level: u32) -> Result<Image>;
+    }
+
+    impl ResourceTexture for Resource {
+        fn texture_is_ycocg(&self) -> Result<bool> {
+            if self.block(BlockKind::RED2).is_none() {
+                return Ok(false);
+            }
+            let doc = self.read_kv3(BlockKind::RED2)?;
+            let Some(deps) = doc
+                .root
+                .get("m_SpecialDependencies")
+                .and_then(|v| v.as_array())
+            else {
+                return Ok(false);
+            };
+            Ok(deps
+                .iter()
+                .any(|d| d.get("m_String").and_then(|s| s.as_str()) == Some(YCOCG_MARKER)))
+        }
+
+        fn decode_texture_rgba8(&self, level: u32) -> Result<Image> {
+            let data = self
+                .data()
+                .ok_or_else(|| Error::BlockNotFound(BlockKind::DATA.to_string()))?;
+            let mut image = Texture::parse(data, &self.trailing)?.decode_rgba8(level)?;
+            if self.texture_is_ycocg()? {
+                image.ycocg_to_rgb();
+            }
+            Ok(image)
         }
     }
 }

@@ -574,3 +574,102 @@ mod vpk_resource_kv3 {
         assert_eq!(untouched, resource(4));
     }
 }
+
+#[cfg(all(feature = "resource", feature = "kv3", feature = "texture"))]
+mod resource_texture {
+    use source2::ext::ResourceTexture;
+    use source2::kv3::{Document, Object, Value};
+    use source2::resource::{Block, BlockKind, Resource};
+    use source2::{Error, texture};
+
+    const MARKER: &str = "Texture Compiler Version Image YCoCg Conversion";
+
+    fn red2(strings: &[&str]) -> Block {
+        let deps = strings
+            .iter()
+            .map(|s| {
+                let mut o = Object::new();
+                o.insert("m_String", *s);
+                o.insert("m_CompilerIdentifier", "CompileTexture");
+                Value::from(o)
+            })
+            .collect();
+        let mut root = Object::new();
+        root.insert("m_SpecialDependencies", Value::array(deps));
+        Block::new(BlockKind::RED2, Document::new(root).to_bytes().unwrap())
+    }
+
+    // A 4x4 BC3 texture whose one block is constant: alpha 100, colour 0xFFFF (255, 255, 255).
+    fn bc3(red2: Option<Block>) -> Resource {
+        let mut data = vec![0u8; 40];
+        data[0] = 1;
+        data[20] = 4;
+        data[22] = 4;
+        data[24] = 1;
+        data[26] = 2;
+        data[27] = 1;
+        data[32] = 8;
+        let mut pixels = vec![100, 100, 0, 0, 0, 0, 0, 0];
+        pixels.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
+        let mut resource = Resource::new();
+        if let Some(block) = red2 {
+            resource.blocks.push(block);
+        }
+        resource.blocks.push(Block::new(BlockKind::DATA, data));
+        resource.with_trailing(pixels)
+    }
+
+    #[test]
+    fn marked_texture_is_converted_from_ycocg() {
+        let resource = bc3(Some(red2(&["Texture Compiler Version", MARKER])));
+        assert!(resource.texture_is_ycocg().unwrap());
+        let img = resource.decode_texture_rgba8(0).unwrap();
+        // Co = Cg = (255 - 128) / 32 = 3.97 and Y = 100: R = 100, G = 103.97, B = 92.06.
+        assert_eq!(img.rgba[..4], [100, 104, 92, 255]);
+        assert_eq!(img.rgba.len(), 4 * 4 * 4);
+    }
+
+    #[test]
+    fn unmarked_texture_is_left_as_decoded() {
+        let resource = bc3(Some(red2(&["Texture Compiler Version"])));
+        assert!(!resource.texture_is_ycocg().unwrap());
+        let img = resource.decode_texture_rgba8(0).unwrap();
+        assert_eq!(img.rgba[..4], [255, 255, 255, 100]);
+    }
+
+    #[test]
+    fn missing_red2_means_unmarked() {
+        let resource = bc3(None);
+        assert!(!resource.texture_is_ycocg().unwrap());
+        assert_eq!(
+            resource.decode_texture_rgba8(0).unwrap().rgba[..4],
+            [255, 255, 255, 100]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_red2_is_an_error() {
+        let resource = bc3(Some(Block::new(BlockKind::RED2, vec![1, 2, 3])));
+        assert!(resource.texture_is_ycocg().is_err());
+        assert!(resource.decode_texture_rgba8(0).is_err());
+    }
+
+    #[test]
+    fn a_resource_without_data_is_an_error() {
+        let resource = Resource::new();
+        assert!(matches!(
+            resource.decode_texture_rgba8(0),
+            Err(Error::BlockNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn texture_errors_are_wrapped() {
+        let err = bc3(None).decode_texture_rgba8(5).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Texture(texture::Error::MipOutOfRange { .. })
+        ));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+}

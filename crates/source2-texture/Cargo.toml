@@ -1,0 +1,16 @@
+[package]
+name = "source2-texture"
+description = "Reader for the Source 2 texture header (vtex_c DATA block) and decoder for BGRA8888, RGBA8888, BC1 and BC3 mips to RGBA8"
+keywords = ["source2", "valve", "texture", "vtex"]
+categories = ["game-development", "parser-implementations", "multimedia::images"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+publish = false
+
+[lints]
+workspace = true

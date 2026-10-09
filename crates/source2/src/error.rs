@@ -30,6 +30,10 @@ pub enum Error {
     #[cfg(feature = "kv3")]
     #[cfg_attr(docsrs, doc(cfg(feature = "kv3")))]
     Kv3(source2_kv3::Error),
+    /// A texture failure.
+    #[cfg(feature = "texture")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "texture")))]
+    Texture(source2_texture::Error),
     /// The pack has no entry with this path.
     EntryNotFound(String),
     /// The resource has no block with this tag.
@@ -61,6 +65,8 @@ impl fmt::Display for Error {
             Error::Kv2(e) => write!(f, "kv2: {e}"),
             #[cfg(feature = "kv3")]
             Error::Kv3(e) => write!(f, "kv3: {e}"),
+            #[cfg(feature = "texture")]
+            Error::Texture(e) => write!(f, "texture: {e}"),
             Error::EntryNotFound(path) => write!(f, "no entry named `{path}`"),
             Error::BlockNotFound(kind) => write!(f, "no block tagged `{kind}`"),
             Error::UnrecognisedFormat { expected, found } => {
@@ -78,6 +84,8 @@ impl std::error::Error for Error {
             Error::Vpk(e) => Some(e),
             #[cfg(feature = "resource")]
             Error::Resource(e) => Some(e),
+            #[cfg(feature = "texture")]
+            Error::Texture(e) => Some(e),
             #[cfg(feature = "kv1")]
             Error::Kv1(e) => Some(e),
             #[cfg(feature = "kv2")]
@@ -100,6 +108,13 @@ impl From<source2_vpk::Error> for Error {
 impl From<source2_resource::Error> for Error {
     fn from(e: source2_resource::Error) -> Self {
         Error::Resource(e)
+    }
+}
+
+#[cfg(feature = "texture")]
+impl From<source2_texture::Error> for Error {
+    fn from(e: source2_texture::Error) -> Self {
+        Error::Texture(e)
     }
 }
 

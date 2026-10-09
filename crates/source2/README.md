@@ -8,6 +8,7 @@ extension traits for moving documents in and out of packs and resources.
 |---|---|---|
 | `source2::vpk` | `source2-vpk` | Valve Pak archives, versions 1 and 2 |
 | `source2::resource` | `source2-resource` | Compiled-resource container, header version 12 |
+| `source2::texture` | `source2-texture` | `vtex_c` textures: BGRA8888, RGBA8888, BC1 and BC3 to RGBA8 |
 | `source2::kv1` | `source2-kv1` | KeyValues 1, text and binary |
 | `source2::kv2` | `source2-kv2` | KeyValues 2 / DMX, text and binary |
 | `source2::kv3` | `source2-kv3` | KeyValues 3, text and binary v1 to v5 |
@@ -28,7 +29,7 @@ source2 = { version = "0.1", default-features = false, features = ["vpk", "kv3",
 
 | Feature | Effect |
 |---|---|
-| `vpk`, `resource`, `kv1`, `kv2`, `kv3` | Enables that module. |
+| `vpk`, `resource`, `texture`, `kv1`, `kv2`, `kv3` | Enables that module. |
 | `lz4` | Enables `kv3` and its LZ4 codec. |
 | `zstd` | Enables `kv3` and its zstd codec. |
 
@@ -65,6 +66,56 @@ let resource = Resource::new()
 let bytes = resource.to_bytes()?;
 assert_eq!(Resource::parse(&bytes)?, resource);
 # Ok::<(), source2::resource::Error>(())
+```
+
+## Texture
+
+A `vtex_c` file is a compiled resource. The header is in its `DATA` block and the pixels
+follow the last block, so `source2::resource` finds both and `source2::texture` decodes them.
+The two crates do not depend on each other.
+
+```
+use source2::texture::Texture;
+
+// A 1x1 BGRA8888 texture: header fields at offsets 20 (width), 22 (height), 24 (depth),
+// 26 (format) and 27 (mip count), then four pixel bytes.
+let mut data = vec![0u8; 40];
+data[20] = 1;
+data[22] = 1;
+data[24] = 1;
+data[26] = 28;
+data[27] = 1;
+let texture = Texture::parse(&data, &[10, 20, 30, 255])?;
+assert_eq!(texture.decode_rgba8(0)?.rgba, [30, 20, 10, 255]);
+# Ok::<(), source2::texture::Error>(())
+```
+
+From a resource, pass `resource.data()` and `&resource.trailing`:
+
+```no_run
+use source2::resource::Resource;
+use source2::texture::Texture;
+
+let bytes = std::fs::read("icon_psd.vtex_c")?;
+let resource = Resource::parse(&bytes)?;
+let data = resource.data().expect("a vtex_c has a DATA block");
+let image = Texture::parse(data, &resource.trailing)?.decode_rgba8(0)?;
+println!("{}x{}", image.width, image.height);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Some BC3 textures hold scaled `YCoCg` instead of RGB. The `RED2` block marks them, and
+`ResourceTexture` (needs `resource`, `kv3` and `texture`) checks the mark and converts only
+when it is there. Plain BC3 is returned as decoded. `texture_is_ycocg` answers the question
+alone. See `source2-texture` for the formula and the mark.
+
+```no_run
+use source2::ext::ResourceTexture;
+use source2::resource::Resource;
+
+let resource = Resource::parse(&std::fs::read("yakuza_sm_psd.vtex_c")?)?;
+let image = resource.decode_texture_rgba8(0)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ## KeyValues 1
@@ -172,7 +223,7 @@ and nothing is chosen from the file extension.
 
 `source2::Error` wraps the error of whichever crate failed (`Error::Vpk`,
 `Error::Resource`, `Error::Kv1`, `Error::Kv2`, `Error::Kv3`, present with their features),
-implements `source()`, and has `From` for each. Its own variants are `EntryNotFound`,
+implements `source()`, and has `From` for each. `source2::texture::Error` is not wrapped: no helper in `ext` reads textures. Its own variants are `EntryNotFound`,
 `BlockNotFound`, `UnrecognisedFormat` and `NotUtf8`. It is `non_exhaustive`.
 
 ## Limitations

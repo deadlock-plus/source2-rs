@@ -1,6 +1,6 @@
 [package]
 name = "source2"
-description = "One dependency for the Source 2 file formats: VPK, compiled resources, KeyValues 1, KeyValues 2 (DMX) and KeyValues 3"
+description = "One dependency for the Source 2 file formats: VPK, compiled resources, textures, KeyValues 1, KeyValues 2 (DMX) and KeyValues 3"
 keywords = ["source2", "valve", "vpk", "keyvalues", "kv3"]
 categories = ["game-development", "parser-implementations", "encoding"]
 version.workspace = true
@@ -15,14 +15,16 @@ publish = false
 [dependencies]
 source2-vpk = { workspace = true, optional = true }
 source2-resource = { workspace = true, optional = true }
+source2-texture = { workspace = true, optional = true }
 source2-kv1 = { workspace = true, optional = true }
 source2-kv2 = { workspace = true, optional = true }
 source2-kv3 = { workspace = true, optional = true }
 
 [features]
-default = ["vpk", "resource", "kv1", "kv2", "kv3", "lz4", "zstd"]
+default = ["vpk", "resource", "texture", "kv1", "kv2", "kv3", "lz4", "zstd"]
 vpk = ["dep:source2-vpk"]
 resource = ["dep:source2-resource"]
+texture = ["dep:source2-texture"]
 kv1 = ["dep:source2-kv1"]
 kv2 = ["dep:source2-kv2"]
 kv3 = ["dep:source2-kv3"]

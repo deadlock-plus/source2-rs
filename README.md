@@ -9,9 +9,10 @@ parse a file, change it, write it back, and nothing the format stores is lost.
 
 | Crate | Format |
 | --- | --- |
-| `source2` | Facade: re-exports all five behind features |
+| `source2` | Facade: re-exports all six behind features |
 | `source2-vpk` | Valve Pak (VPK) archives |
 | `source2-resource` | Compiled-resource containers (`*_c`) |
+| `source2-texture` | Texture (`vtex_c`) header and pixel decoding |
 | `source2-kv1` | KeyValues 1, text and binary |
 | `source2-kv2` | KeyValues 2 / DMX, text and binary |
 | `source2-kv3` | KeyValues 3, text and binary |
@@ -75,6 +76,16 @@ The crates read and write the files described below. Anything outside that retur
 - Tables with overlapping or out-of-order blocks return `BadLayout` and are not written.
 - Writing a file over 4 GiB returns `TooLarge`.
 
+### `source2-texture`
+
+- It decodes mips to 8-bit RGBA from BGRA8888, RGBA8888, BC1 and BC3 only. Other pixel formats return `UnsupportedFormat`: BC7, BC6H, the PNG-embedded formats, and every other number.
+- Mips stored compressed (extra data type 3) return `UnsupportedCompressedMips`. In a sample of 600 Deadlock textures, 289 had them and 85 decoded.
+- Cube maps, volumes and arrays return `UnsupportedLayout`.
+- It reads plain slices: the `DATA` block and the pixel bytes after the last resource block. Use `source2-resource` to get both.
+- It reads only. It does not write textures or encode PNG.
+- Unit tests compare against hand-computed blocks. A spike decoder with the same formulas matched the Deadlock API's PNGs (BGRA8888) and Pillow (BC1, BC3, within 1 per channel). This crate's output was not compared with either.
+- Every mip chain of the 85 decodable sampled textures tiled the pixel bytes exactly.
+
 ### `source2-kv1`
 
 - UTF-16 text returns `UnsupportedEncoding`.
@@ -100,7 +111,7 @@ The crates read and write the files described below. Anything outside that retur
 
 These formats have no crate:
 
-- Payloads inside compiled resources: `vsnd_c`, `vtex_c`, `vpcf_c`, `vmat_c`, `vmdl_c`, `vnmclip_c`, and panorama `_c` files
+- Payloads inside compiled resources: `vsnd_c`, `vpcf_c`, `vmat_c`, `vmdl_c`, `vnmclip_c`, and panorama `_c` files
 - Shader files (`.vcs`)
 - Protobuf files (`.stats`, `.soc`)
 - `.fgd` and `.vfont` files

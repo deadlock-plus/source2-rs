@@ -6,6 +6,7 @@
     doctest,
     feature = "vpk",
     feature = "resource",
+    feature = "texture",
     feature = "kv1",
     feature = "kv2",
     feature = "kv3"
@@ -27,6 +28,10 @@ pub use source2_vpk as vpk;
 #[cfg(feature = "resource")]
 #[cfg_attr(docsrs, doc(cfg(feature = "resource")))]
 pub use source2_resource as resource;
+
+#[cfg(feature = "texture")]
+#[cfg_attr(docsrs, doc(cfg(feature = "texture")))]
+pub use source2_texture as texture;
 
 #[cfg(feature = "kv1")]
 #[cfg_attr(docsrs, doc(cfg(feature = "kv1")))]

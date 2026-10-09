@@ -22,6 +22,7 @@ dependencies = [
  "source2-kv2",
  "source2-kv3",
  "source2-resource",
+ "source2-texture",
  "source2-vpk",
 ]
 
@@ -44,6 +45,10 @@ dependencies = [
 
 [[package]]
 name = "source2-resource"
+version = "0.1.0"
+
+[[package]]
+name = "source2-texture"
 version = "0.1.0"
 
 [[package]]
