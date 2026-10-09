@@ -193,6 +193,47 @@ fn mip_size(format: Format, width: u32, height: u32) -> Option<u64> {
     }
 }
 
+fn decode_embedded_png(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let bad = |reason: String| Error::BadEmbeddedImage { reason };
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().map_err(|e| bad(e.to_string()))?;
+    let (w, h) = reader.info().size();
+    if (w, h) != (width, height) {
+        return Err(bad(format!("is {w}x{h}, the header says {width}x{height}")));
+    }
+    let mut buf = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or_else(|| bad("too large".into()))?
+    ];
+    let frame = reader
+        .next_frame(&mut buf)
+        .map_err(|e| bad(e.to_string()))?;
+    if frame.bit_depth != png::BitDepth::Eight {
+        return Err(bad(format!("bit depth {:?}", frame.bit_depth)));
+    }
+    buf.truncate(frame.buffer_size());
+    match frame.color_type {
+        png::ColorType::Rgba => Ok(buf),
+        png::ColorType::Rgb => Ok(buf
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect()),
+        png::ColorType::Grayscale => Ok(buf.iter().flat_map(|&g| [g, g, g, 255]).collect()),
+        png::ColorType::GrayscaleAlpha => Ok(buf
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect()),
+        png::ColorType::Indexed => Err(bad("indexed colour left unexpanded".into())),
+    }
+}
+
 impl<'a> Texture<'a> {
     /// Reads a 2D texture of a supported format.
     ///
@@ -218,6 +259,19 @@ impl<'a> Texture<'a> {
         }
         if header.flags & FLAG_VOLUME != 0 || header.depth > 1 {
             return Err(Error::UnsupportedLayout { kind: "volume" });
+        }
+        if matches!(header.format, Format::PngRgba8888 | Format::PngDxt5) {
+            // The mip is a PNG file of whatever length; there is no size to derive.
+            if header.mip_count != 1 {
+                return Err(Error::UnsupportedFormat {
+                    format: header.format,
+                });
+            }
+            return Ok(Texture {
+                header,
+                pixels,
+                mip_sizes: vec![pixels.len()],
+            });
         }
         let mut sizes = Vec::with_capacity(usize::from(header.mip_count));
         let mut total = 0u64;
@@ -306,8 +360,10 @@ impl<'a> Texture<'a> {
 
     /// Decodes a mip to 8-bit RGBA.
     ///
-    /// The output is at most 8 times the mip's stored size, so a texture that passed
-    /// [`Texture::parse`] cannot make this allocate more than its input justifies.
+    /// For the block formats the output is at most 8 times the mip's stored size, so a texture
+    /// that passed [`Texture::parse`] cannot make this allocate more than its input justifies.
+    /// An embedded PNG must match the header's dimensions, and the `png` decoder's own memory
+    /// limit applies.
     ///
     /// # Errors
     ///
@@ -326,6 +382,7 @@ impl<'a> Texture<'a> {
             }
             Format::Bc1 => bc::decode_bc1(data, width, height),
             Format::Bc3 => bc::decode_bc3(data, width, height),
+            Format::PngRgba8888 | Format::PngDxt5 => decode_embedded_png(data, width, height)?,
             format => return Err(Error::UnsupportedFormat { format }),
         };
         Ok(Image {

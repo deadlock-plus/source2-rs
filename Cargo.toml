@@ -26,6 +26,8 @@ ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 # Encoder only; `ruzstd` decodes. Valve's files are level 7 with a content checksum, which
 # `ruzstd` cannot write (Fastest only). Pure Rust and `forbid(unsafe_code)`.
 zstd-rs = { version = "0.1", default-features = false }
+# Decodes the PNG files some textures embed as their mip data. Pure Rust.
+png = { version = "0.18", default-features = false }
 
 [workspace.lints.rust]
 missing_docs = "warn"

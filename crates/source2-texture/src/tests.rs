@@ -8,6 +8,8 @@ use super::*;
 const FORMAT_BC1: u8 = 1;
 const FORMAT_BC3: u8 = 2;
 const FORMAT_RGBA8888: u8 = 4;
+const FORMAT_PNG_RGBA8888: u8 = 16;
+const FORMAT_PNG_DXT5: u8 = 18;
 const FORMAT_BGRA8888: u8 = 28;
 
 fn header(width: u16, height: u16, depth: u16, format: u8, mips: u8) -> Vec<u8> {
@@ -266,8 +268,6 @@ fn mip_out_of_range_is_an_error() {
 #[test]
 fn unsupported_formats_are_distinct_errors() {
     for (n, f) in [
-        (16, Format::PngRgba8888),
-        (18, Format::PngDxt5),
         (19, Format::Bc6h),
         (20, Format::Bc7),
         (23, Format::Other(23)),
@@ -667,4 +667,80 @@ fn ycocg_rounds_to_nearest_and_clamps() {
     let mut img = ycocg_image(&[[228, 128, 0, 250], [228, 128, 0, 10]]);
     img.ycocg_to_rgb();
     assert_eq!(img.rgba, [255, 250, 150, 255, 110, 10, 0, 255]);
+}
+
+fn png_file(width: u32, height: u32, color: png::ColorType, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(color);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(data).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+#[test]
+fn embedded_png_rgba_decodes_to_its_pixels() {
+    let pixels: Vec<u8> = (0..24).collect();
+    let file = png_file(3, 2, png::ColorType::Rgba, &pixels);
+    for format in [FORMAT_PNG_RGBA8888, FORMAT_PNG_DXT5] {
+        let img = single(format, 3, 2, &file);
+        assert_eq!((img.width, img.height), (3, 2));
+        assert_eq!(img.rgba, pixels);
+    }
+}
+
+#[test]
+fn embedded_png_rgb_gets_opaque_alpha() {
+    let file = png_file(2, 1, png::ColorType::Rgb, &[1, 2, 3, 4, 5, 6]);
+    let img = single(FORMAT_PNG_RGBA8888, 2, 1, &file);
+    assert_eq!(img.rgba, [1, 2, 3, 255, 4, 5, 6, 255]);
+}
+
+#[test]
+fn embedded_png_with_other_dimensions_is_rejected() {
+    let file = png_file(2, 2, png::ColorType::Rgba, &[0; 16]);
+    let t = Texture::parse(&header(4, 4, 1, FORMAT_PNG_RGBA8888, 1), &file).unwrap();
+    assert!(matches!(
+        t.decode_rgba8(0),
+        Err(Error::BadEmbeddedImage { .. })
+    ));
+}
+
+#[test]
+fn embedded_png_garbage_is_an_error_not_a_panic() {
+    let t = Texture::parse(&header(2, 2, 1, FORMAT_PNG_RGBA8888, 1), &[1, 2, 3]).unwrap();
+    assert!(matches!(
+        t.decode_rgba8(0),
+        Err(Error::BadEmbeddedImage { .. })
+    ));
+}
+
+#[test]
+fn embedded_png_with_several_mips_is_unsupported() {
+    assert_eq!(
+        Texture::parse(&header(4, 4, 1, FORMAT_PNG_RGBA8888, 2), &[0; 8]).err(),
+        Some(Error::UnsupportedFormat {
+            format: Format::PngRgba8888
+        })
+    );
+}
+
+/// `DEADLOCK_CITADEL_DIR=".../Deadlock/game/citadel" cargo test -p source2-texture -- --ignored`
+#[test]
+#[ignore = "needs an installed game; set DEADLOCK_CITADEL_DIR"]
+fn real_embedded_png_icon_decodes() {
+    let dir = std::env::var("DEADLOCK_CITADEL_DIR").expect("set DEADLOCK_CITADEL_DIR");
+    let vpk = source2_vpk::Vpk::open(std::path::Path::new(&dir).join("pak01_dir.vpk")).unwrap();
+    let entry = vpk
+        .find("panorama/images/heroes/hornet_sm_png.vtex_c")
+        .unwrap();
+    let bytes = vpk.read(entry).unwrap();
+    let resource = source2_resource::Resource::parse(&bytes).unwrap();
+    let data = resource.block(source2_resource::BlockKind::DATA).unwrap();
+    let t = Texture::parse(&data.data, &resource.trailing).unwrap();
+    let img = t.decode_rgba8(0).unwrap();
+    assert_eq!((img.width, img.height), (128, 128));
+    assert!(img.rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 0));
 }

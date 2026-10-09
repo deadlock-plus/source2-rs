@@ -1,12 +1,12 @@
 # source2-texture
 
-Reader for Source 2 textures (`vtex_c`) and decoder from four pixel formats to 8-bit RGBA.
+Reader for Source 2 textures (`vtex_c`) and decoder from five pixel formats to 8-bit RGBA.
 
 - A `vtex_c` is a compiled resource. Its `DATA` block holds a 40-byte header. The pixels are
   not in that block: they are the bytes after the last resource block.
 - This crate takes those two byte slices. It does not read the resource container. Use
   `source2-resource` for that (`Resource::data()` and `Resource::trailing`).
-- It reads only. It does not write textures and does not encode PNG.
+- It reads only. It does not write textures. It decodes embedded PNG but does not encode PNG.
 - No dependencies, no feature flags, no `unsafe`.
 
 ## Install
@@ -109,6 +109,7 @@ assert_eq!(image.rgba, [110, 100, 90, 255]);
 | `Rgba8888` | 4 | Copied. |
 | `Bc1` | 1 | Four-colour and three-colour blocks. In a three-colour block the fourth entry is transparent. |
 | `Bc3` | 2 | Colour block always four-colour. Alpha from the 8-value or 6-value alpha block. |
+| `PngRgba8888`, `PngDxt5` | 16, 18 | The single mip is a PNG file. 8-bit, any colour type, expanded to RGBA. Its size must match the header. |
 
 Colours expand from 5 and 6 bits with rounding. Interpolated colours use integer division.
 Another decoder may differ by 1 per channel.
@@ -122,8 +123,9 @@ bad input and nothing is guessed.
 | --- | --- |
 | `Truncated` | The header or its extra-data table does not fit in the block. |
 | `ZeroDimension` | Width, height, depth or mip count is zero. |
-| `UnsupportedFormat` | The format is not one of the four above (BC7, BC6H, PNG-embedded, ETC2 and every other number). |
+| `UnsupportedFormat` | The format is not one of the above (BC7, BC6H, ETC2 and every other number). |
 | `UnsupportedLayout` | The flags say cube map, volume or array, or depth is above 1. |
+| `BadEmbeddedImage` | A PNG-embedded mip is malformed or its size differs from the header. |
 | `UnsupportedCompressedMips` | The extra-data table has an entry of type 3. |
 | `BadPixelLength` | The pixel slice length differs from what the mips need. |
 | `MipOutOfRange` | The mip index is not below the mip count. |
@@ -143,8 +145,10 @@ decoder allocate more than the input justifies.
   checking anything when no install is found.
 - The `YCoCg` conversion is checked against hand-computed pixels. In the `source2` tests, a
   converted Deadlock icon differs from the published image by at most 3 per channel.
-- Not checked: the output of this crate against another decoder, and any texture of a
-  format other than the four decoded ones.
+- A Deadlock hero icon stored as an embedded PNG (format 16) decodes in an ignored test
+  that needs an install.
+- Not checked: the output of this crate against another decoder, any format 18 file, and any
+  texture of a format other than the decoded ones.
 
 ## Known limitations
 

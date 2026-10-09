@@ -39,6 +39,11 @@ pub enum Error {
         /// Length given, in bytes.
         actual: u64,
     },
+    /// The PNG file embedded as a mip is malformed, or does not match the header.
+    BadEmbeddedImage {
+        /// What was wrong with it.
+        reason: String,
+    },
     /// The requested mip does not exist.
     MipOutOfRange {
         /// The index asked for. Index 0 is the largest mip.
@@ -63,6 +68,7 @@ impl std::fmt::Display for Error {
             Error::BadPixelLength { expected, actual } => {
                 write!(f, "mips need {expected} pixel bytes, got {actual}")
             }
+            Error::BadEmbeddedImage { reason } => write!(f, "embedded PNG: {reason}"),
             Error::MipOutOfRange { index, count } => {
                 write!(f, "mip {index} out of range for {count} mips")
             }

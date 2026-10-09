@@ -78,7 +78,7 @@ The crates read and write the files described below. Anything outside that retur
 
 ### `source2-texture`
 
-- It decodes mips to 8-bit RGBA from BGRA8888, RGBA8888, BC1 and BC3 only. Other pixel formats return `UnsupportedFormat`: BC7, BC6H, the PNG-embedded formats, and every other number.
+- It decodes mips to 8-bit RGBA from BGRA8888, RGBA8888, BC1, BC3 and the PNG-embedded formats (16 and 18, single mip, 8-bit PNG). Other pixel formats return `UnsupportedFormat`: BC7, BC6H, and every other number. A malformed embedded PNG, or one whose size differs from the header, returns `BadEmbeddedImage`. Only format 16 was checked against a real file; format 18 is decoded the same way without a sample.
 - Mips stored compressed (extra data type 3) return `UnsupportedCompressedMips`. In a sample of 600 Deadlock textures, 289 had them and 85 decoded.
 - Cube maps, volumes and arrays return `UnsupportedLayout`.
 - It reads plain slices: the `DATA` block and the pixel bytes after the last resource block. Use `source2-resource` to get both.
