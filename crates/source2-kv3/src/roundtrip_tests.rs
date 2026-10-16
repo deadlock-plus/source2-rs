@@ -88,6 +88,14 @@ fn zero_and_one_keep_their_constant_codes() {
         type_code(&stored(Value::double(1.0), Version::V5)),
         node::DOUBLE_ONE
     );
+    assert_eq!(
+        type_code(&stored(Value::uint(0), Version::V5)),
+        node::UINT32_ZERO
+    );
+    assert_eq!(
+        type_code(&stored(Value::uint(1), Version::V5)),
+        node::UINT32_ONE
+    );
 }
 
 #[test]
@@ -383,6 +391,7 @@ fn irregular(version: Version) -> Value {
         ("float", scalar_as(Kind::Double(1.5), node::FLOAT)),
         ("wide_zero", scalar_as(Kind::Int(0), node::INT64)),
         ("small_unsigned", scalar_as(Kind::UInt(3), node::UINT64)),
+        ("wide_uint_zero", scalar_as(Kind::UInt(0), node::UINT32)),
         (
             "same_but_general",
             array_as(ArrayForm::General, vec![double(2.5), double(2.5)]),
@@ -422,6 +431,8 @@ fn irregular(version: Version) -> Value {
         ),
     ];
     if version == Version::V5 {
+        members.push(("uint_zero", scalar_as(Kind::UInt(0), node::UINT32_ZERO)));
+        members.push(("uint_one", scalar_as(Kind::UInt(1), node::UINT32_ONE)));
         members.push((
             "aux",
             array_as(

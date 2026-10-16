@@ -330,6 +330,35 @@ fn two_byte_scalars_are_widened_where_the_revision_has_no_pool() {
 }
 
 #[test]
+fn unsigned_zero_and_one_constants_are_written_only_to_v5() {
+    let tree = root(vec![
+        ("zero", Value::uint(0)),
+        ("one", Value::uint(1)),
+        (
+            "stored",
+            Value::stored(Kind::UInt(0), 0, Storage::Scalar(node::UINT32_ZERO)),
+        ),
+    ]);
+    for version in ALL {
+        let block = write(&tree, &options(version, Compression::None)).unwrap();
+        let back = parse(&block).unwrap().root;
+        assert_eq!(back, tree, "{version:?}");
+        let code = |key: &str| match back.get(key).unwrap().storage() {
+            Storage::Scalar(ty) => ty,
+            other => panic!("{other:?}"),
+        };
+        let (zero, one) = if version == Version::V5 {
+            (node::UINT32_ZERO, node::UINT32_ONE)
+        } else {
+            (node::UINT32, node::UINT32)
+        };
+        assert_eq!(code("zero"), zero, "{version:?}");
+        assert_eq!(code("one"), one, "{version:?}");
+        assert_eq!(code("stored"), zero, "{version:?}");
+    }
+}
+
+#[test]
 fn numeric_arrays_use_the_layout_each_revision_has() {
     let tree = root(vec![(
         "xs",

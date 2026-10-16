@@ -81,15 +81,21 @@ fn a_constant_type_code_does_not_outlive_its_value() {
         ("one", hinted(Kind::Int(1), node::INT64_ONE)),
         ("half", hinted(Kind::Double(0.0), node::DOUBLE_ZERO)),
         ("yes", hinted(Kind::Bool(true), node::BOOLEAN_TRUE)),
+        ("uzero", hinted(Kind::UInt(0), node::UINT32_ZERO)),
     ]);
     let mut doc = through_a_file(&tree, Version::V5);
     *doc.root.get_mut("zero").unwrap().kind_mut() = Kind::Int(5);
     *doc.root.get_mut("one").unwrap().kind_mut() = Kind::String("one".into());
     *doc.root.get_mut("half").unwrap().kind_mut() = Kind::Double(0.5);
     *doc.root.get_mut("yes").unwrap().kind_mut() = Kind::Bool(false);
+    *doc.root.get_mut("uzero").unwrap().kind_mut() = Kind::UInt(7);
     let expected = doc.root.clone();
     let back = parse(&doc.to_bytes_with(&options(Version::V5)).unwrap()).unwrap();
     assert_eq!(back.root, expected);
+    assert_eq!(
+        scalar_code_of(back.root.get("uzero").unwrap()),
+        node::UINT32
+    );
 }
 
 #[test]

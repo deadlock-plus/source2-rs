@@ -580,7 +580,9 @@ impl<'a> Reader<'a> {
             | node::INT64_ZERO
             | node::INT64_ONE
             | node::DOUBLE_ZERO
-            | node::DOUBLE_ONE => 0,
+            | node::DOUBLE_ONE
+            | node::UINT32_ZERO
+            | node::UINT32_ONE => 0,
             node::BOOLEAN | node::INT32_AS_BYTE => u64::from(self.buffer.u8()?),
             node::INT16 | node::UINT16 => u64::from(self.buffer.u16()?),
             node::INT32 | node::UINT32 | node::FLOAT => u64::from(self.buffer.u32()?),

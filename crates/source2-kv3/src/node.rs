@@ -26,11 +26,14 @@ pub(crate) const UINT16: u8 = 21;
 pub(crate) const INT32_AS_BYTE: u8 = 23;
 pub(crate) const ARRAY_TYPE_BYTE_LENGTH: u8 = 24;
 pub(crate) const ARRAY_TYPE_AUXILIARY_BUFFER: u8 = 25;
+pub(crate) const UINT32_ZERO: u8 = 26;
+pub(crate) const UINT32_ONE: u8 = 27;
 
 /// The type code a scalar kind is stored under unless told otherwise.
 ///
 /// Integers take the 4-byte type when they fit and the 8-byte one when not. Doubles are never
-/// narrowed. With `shorthand`, `0` and `1` (and `0.0`, `1.0`) are type codes alone.
+/// narrowed. With `shorthand`, `0` and `1` (and `0.0`, `1.0`) are type codes alone; the
+/// unsigned ones are v5 only, which the writer's layout checks.
 pub(crate) fn default_scalar_type(kind: &Kind, shorthand: bool) -> Option<u8> {
     Some(match kind {
         Kind::Null => NULL,
@@ -40,6 +43,8 @@ pub(crate) fn default_scalar_type(kind: &Kind, shorthand: bool) -> Option<u8> {
         Kind::Int(1) if shorthand => INT64_ONE,
         Kind::Int(v) if i32::try_from(*v).is_ok() => INT32,
         Kind::Int(_) => INT64,
+        Kind::UInt(0) if shorthand => UINT32_ZERO,
+        Kind::UInt(1) if shorthand => UINT32_ONE,
         Kind::UInt(v) if u32::try_from(*v).is_ok() => UINT32,
         Kind::UInt(_) => UINT64,
         Kind::Double(v) if shorthand && v.to_bits() == 0 => DOUBLE_ZERO,
@@ -57,7 +62,9 @@ pub(crate) fn scalar_bits(kind: &Kind, ty: u8) -> Option<u64> {
         | (Kind::Bool(true), BOOLEAN_TRUE)
         | (Kind::Bool(false), BOOLEAN_FALSE)
         | (Kind::Int(0), INT64_ZERO)
-        | (Kind::Int(1), INT64_ONE) => Some(0),
+        | (Kind::Int(1), INT64_ONE)
+        | (Kind::UInt(0), UINT32_ZERO)
+        | (Kind::UInt(1), UINT32_ONE) => Some(0),
         (Kind::Bool(b), BOOLEAN) => Some(u64::from(*b)),
         (Kind::Int(v), INT32_AS_BYTE) => i8::try_from(*v).ok().map(|v| u64::from(v as u8)),
         (Kind::Int(v), INT16) => i16::try_from(*v).ok().map(|v| u64::from(v as u16)),
@@ -83,9 +90,8 @@ pub(crate) fn scalar_bits(kind: &Kind, ty: u8) -> Option<u64> {
 /// scalar.
 pub(crate) fn operand_width(ty: u8) -> Option<usize> {
     match ty {
-        NULL | BOOLEAN_TRUE | BOOLEAN_FALSE | INT64_ZERO | INT64_ONE | DOUBLE_ZERO | DOUBLE_ONE => {
-            Some(0)
-        }
+        NULL | BOOLEAN_TRUE | BOOLEAN_FALSE | INT64_ZERO | INT64_ONE | DOUBLE_ZERO | DOUBLE_ONE
+        | UINT32_ZERO | UINT32_ONE => Some(0),
         BOOLEAN | INT32_AS_BYTE => Some(1),
         INT16 | UINT16 => Some(2),
         INT32 | UINT32 | FLOAT => Some(4),
@@ -104,6 +110,8 @@ pub(crate) fn scalar_value(ty: u8, bits: u64, flags: u8) -> Value {
         INT64_ONE => Kind::Int(1),
         DOUBLE_ZERO => Kind::Double(0.0),
         DOUBLE_ONE => Kind::Double(1.0),
+        UINT32_ZERO => Kind::UInt(0),
+        UINT32_ONE => Kind::UInt(1),
         INT32_AS_BYTE => Kind::Int(i64::from(bits as u8 as i8)),
         INT16 => Kind::Int(i64::from(bits as u16 as i16)),
         UINT16 | UINT32 | UINT64 => Kind::UInt(bits),

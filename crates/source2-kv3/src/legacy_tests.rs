@@ -354,6 +354,18 @@ fn legacy_constant_types_take_no_operand() {
 }
 
 #[test]
+fn legacy_uint32_constants_take_no_operand() {
+    let mut body = vec![8];
+    body.extend(u32le(2));
+    body.extend([26, 27]);
+    let doc = parse(&legacy_raw(&legacy_stream(&[], &body))).expect("parse");
+    let items = doc.root.as_array().expect("root is an array");
+    assert_eq!(items, [Value::uint(0), Value::uint(1)]);
+    assert_eq!(items[0].storage(), Storage::Scalar(26));
+    assert_eq!(items[1].storage(), Storage::Scalar(27));
+}
+
+#[test]
 fn legacy_blob_is_read_inline() {
     let mut body = vec![7];
     body.extend(u32le(3));
@@ -549,6 +561,25 @@ fn v1_strings_start_on_an_eight_byte_boundary_even_without_eight_byte_values() {
         parse(&block).expect("parse").root,
         Value::array(vec![Value::int(4)])
     );
+}
+
+#[test]
+fn pooled_uint32_constants_take_no_operand() {
+    let doc = FlatDoc {
+        ints: vec![2, 0, 1],
+        strings: vec!["zero", "one"],
+        types: vec![9, 26, 27],
+        ..FlatDoc::default()
+    };
+    let root = parse(&doc.block(MAGIC_V1, Compression::None))
+        .expect("parse")
+        .root;
+    assert_eq!(
+        root,
+        object(vec![("zero", Value::uint(0)), ("one", Value::uint(1))])
+    );
+    assert_eq!(root.get("zero").unwrap().storage(), Storage::Scalar(26));
+    assert_eq!(root.get("one").unwrap().storage(), Storage::Scalar(27));
 }
 
 #[test]

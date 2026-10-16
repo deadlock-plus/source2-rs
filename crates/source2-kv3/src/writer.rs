@@ -15,7 +15,8 @@
 //! do:
 //!
 //! - Integers take the 4-byte type when they fit and the 8-byte one when not, with `0` and `1`
-//!   as type codes alone. Doubles are never narrowed, and `0.0` and `1.0` are type codes alone.
+//!   as type codes alone (unsigned ones only on v5). Doubles are never narrowed, and `0.0` and
+//!   `1.0` are type codes alone.
 //! - An array whose elements are all numbers of one type, strings, objects or arrays with one
 //!   type code and flag byte is stored as a typed array: element type once, then the elements,
 //!   which do not use the `0` and `1` shorthands. Anything else, including an empty array,
@@ -328,6 +329,8 @@ impl Layout {
             node::INT16 | node::UINT16 => {
                 self.version.has_two_byte_pool() || self.version == Version::Legacy
             }
+            // Added to the format long after v5 shipped; older revisions' readers predate them.
+            node::UINT32_ZERO | node::UINT32_ONE => self.version == Version::V5,
             _ => true,
         }
     }
@@ -507,7 +510,10 @@ pub(crate) fn scalar_code(v: &Value, layout: Layout) -> u8 {
         {
             ty
         }
-        _ => default_scalar_type(v.kind(), true).expect("scalar kinds have a type"),
+        _ => default_scalar_type(v.kind(), true)
+            .filter(|&ty| layout.can_store_scalar(ty))
+            .or_else(|| default_scalar_type(v.kind(), false))
+            .expect("scalar kinds have a type"),
     }
 }
 
